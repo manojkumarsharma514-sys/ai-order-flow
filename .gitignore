@@ -1,8 +1,26 @@
-venv/
+# Python bytecode & cache
 __pycache__/
 *.pyc
 *.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data, Logs, and Local SQLite Databases
+*.db
+*.csv
+data/cache/
+data/replay/
+data/candles/
+
+# Sensitive Configs & Keys
+config/exchange.json
+config/app_state.json
 .env
-logs/
+
+# System & IDE files
+.DS_Store
 .vscode/
 .idea/
