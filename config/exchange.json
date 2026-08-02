@@ -1,0 +1,9 @@
+{
+  "exchange": "delta",
+  "environment": "testnet",
+  "api_key": "WCMSapKAgU5V6zchs39BMPCcE4aPuL",
+  "api_secret": "q5g3chZrdM27fHmim9Nf5D7oIvSeDZUzyJIsWLcbMRAn4lDWUyYTqpTwJCw0",
+  "rest_url": "https://testnet-api.delta.exchange",
+  "ws_url": "wss://testnet-socket.delta.exchange",
+  "default_symbol": "BTCUSDT"
+}

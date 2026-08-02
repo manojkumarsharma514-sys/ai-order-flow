@@ -1,0 +1,10 @@
+{
+  "default_leverage": 25,
+  "capital_allocation_pct": 50.0,
+  "trade_risk_pct": 2.0,
+  "auto_trade_size_btc": 1.0,
+  "default_stop_loss_pct": 0.5,
+  "default_take_profit_pct": 1.5,
+  "min_ai_confidence_pct": 75,
+  "cooldown_seconds": 60
+}
