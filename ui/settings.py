@@ -150,6 +150,19 @@ class SettingsPanel(QWidget):
         # -------- Paper account --------
         layout.addWidget(_section_title("Paper Account"))
 
+        self.starting_balance_spin = QDoubleSpinBox()
+        self.starting_balance_spin.setRange(1, 100_000_000)
+        self.starting_balance_spin.setDecimals(2)
+        self.starting_balance_spin.setSingleStep(100)
+        self.starting_balance_spin.setValue(10000.0)
+        self.starting_balance_spin.setPrefix("$ ")
+        self.starting_balance_spin.setToolTip(
+            "What RESET BALANCE below resets the paper account back to.\n"
+            "Doesn't change your CURRENT balance by itself — click Save,\n"
+            "then RESET BALANCE, to apply it immediately."
+        )
+        layout.addLayout(_row("Starting Paper Balance", self.starting_balance_spin))
+
         reset_row = QHBoxLayout()
         reset_label = QLabel("Reset paper balance and close all positions")
         reset_label.setStyleSheet("QLabel{font-size:12px; color:#c7cbd6;}")
@@ -164,7 +177,7 @@ class SettingsPanel(QWidget):
             }
             QPushButton:hover{ background:#ff8a65; color:#131722; }
         """)
-        self.reset_btn.clicked.connect(self.reset_balance_clicked.emit)
+        self.reset_btn.clicked.connect(self._on_reset_clicked)
         reset_row.addWidget(self.reset_btn)
         layout.addLayout(reset_row)
 
@@ -211,7 +224,27 @@ class SettingsPanel(QWidget):
             "default_take_profit_pct": self.tp_pct_spin.value(),
             "min_ai_confidence_pct": self.confidence_spin.value(),
             "cooldown_seconds": self.cooldown_spin.value(),
+            "starting_paper_balance": self.starting_balance_spin.value(),
         }
+
+    def _on_reset_clicked(self):
+        """RESET BALANCE (this tab's copy). Previously this only
+        emitted reset_balance_clicked directly — if the trader changed
+        Starting Paper Balance and clicked Reset before ever clicking
+        Save, DashboardController's paper_engine.starting_balance was
+        still the OLD value, so Reset silently applied the wrong
+        number (and the field, having auto-saved on THIS click, looked
+        correct afterward even though the balance wasn't). Emitting
+        save_settings_clicked first — a direct/synchronous Qt
+        connection, so DashboardController._on_save_settings has
+        already run and updated starting_balance by the time this
+        function's next line executes — guarantees Reset always acts
+        on whatever's currently showing in the spinner, no matter what
+        order the trader clicks these two buttons in.
+        """
+        self.save_settings_clicked.emit(self._collect_settings())
+        self.saved_label.setText("✓ Saved")
+        self.reset_balance_clicked.emit()
 
     def _on_save_clicked(self):
         self.save_settings_clicked.emit(self._collect_settings())
@@ -232,6 +265,7 @@ class SettingsPanel(QWidget):
             "default_take_profit_pct": self.tp_pct_spin,
             "min_ai_confidence_pct": self.confidence_spin,
             "cooldown_seconds": self.cooldown_spin,
+            "starting_paper_balance": self.starting_balance_spin,
         }
 
         for key, widget in widgets.items():

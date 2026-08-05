@@ -17,6 +17,9 @@ try:
 except Exception:
     pass
 
+from core.runtime_paths import ensure_user_data_dir
+from core.crash_handler import install as install_crash_handler
+
 from ui.dashboard import Dashboard
 from core.ws_bridge import WebSocketBridge
 from core.websocket_thread import WebSocketThread
@@ -24,7 +27,18 @@ from core.websocket_thread import WebSocketThread
 
 def main():
 
+    # Create/seed the writable per-user config+data+logs folder BEFORE
+    # anything else touches disk (ConfigManager, AppStateHandler,
+    # OrdersManager, JournalManager, AnalyticsEngine all read/write
+    # under this the moment the Dashboard/Controller construct).
+    ensure_user_data_dir()
+
     app = QApplication(sys.argv)
+
+    # Installed as early as possible so literally nothing that follows
+    # can crash to a bare terminal traceback (or, worse, a silent exit)
+    # under a --windowed build with no console attached.
+    install_crash_handler()
 
     window = Dashboard()
     window.show()

@@ -378,7 +378,17 @@ class TradeSetup(QWidget):
 
         self.warning_label = QLabel("")
         self.warning_label.setObjectName("warning")
-        self.warning_label.setVisible(False)
+        # Fixed height, ALWAYS part of the layout (never hidden) — a
+        # rejection/skip banner appearing and disappearing used to
+        # change this panel's total height every time
+        # AutoTradeExecutor posted or cleared a message, which visibly
+        # "stretched"/reflowed the fixed-height bottom splitter row
+        # (Positions / Recent Trades / Trade Setup) this panel lives
+        # in. Reserving the space permanently and only ever changing
+        # the *text* (see show_rejection / _clear_warning below) means
+        # this panel's height can never move again, no matter how
+        # often or rapidly rejection messages come in.
+        self.warning_label.setFixedHeight(18)
         card_layout.addWidget(self.warning_label)
 
         main_layout.addWidget(self.card)
@@ -396,7 +406,7 @@ class TradeSetup(QWidget):
 
         self._warning_timer = QTimer(self)
         self._warning_timer.setSingleShot(True)
-        self._warning_timer.timeout.connect(lambda: self.warning_label.setVisible(False))
+        self._warning_timer.timeout.connect(self._clear_warning)
 
         self._last_price = 0.0
 
@@ -621,9 +631,19 @@ class TradeSetup(QWidget):
         self._update_rr()
 
     def show_rejection(self, message):
+        """Show a rejection/skip reason below the Buy/Sell buttons.
+        Only the label's TEXT changes here — never its visibility or
+        height (see the QLabel construction above) — so this can be
+        called as often as AutoTradeExecutor needs to without ever
+        reflowing the panel around it."""
         self.warning_label.setText(f"⛔ {message}")
-        self.warning_label.setVisible(True)
         self._warning_timer.start(5000)
+
+    def _clear_warning(self):
+        """5-second auto-hide, implemented as clearing the text rather
+        than hiding the widget — the label's fixed-height slot stays
+        reserved either way, so nothing around it ever moves."""
+        self.warning_label.setText("")
 
     def set_size(self, size):
         self.size.setValue(round(size, 3))

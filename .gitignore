@@ -23,4 +23,11 @@ config/app_state.json
 # System & IDE files
 .DS_Store
 .vscode/
-.idea/
+.idea/dist/ 
+build/ 
+*.spec 
+__pycache__/ 
+*.pyc 
+dist/ 
+build/ 
+*.spec 

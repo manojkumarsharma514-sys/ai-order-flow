@@ -4,7 +4,8 @@ from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QPixmap
 
-DELTA_LOGO_PATH = Path("assets") / "images" / "delta_logo.png"
+from core.runtime_paths import ASSETS_DIR
+DELTA_LOGO_PATH = ASSETS_DIR / "images" / "delta_logo.png"
 
 
 class StatusBar(QWidget):

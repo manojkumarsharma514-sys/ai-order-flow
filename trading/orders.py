@@ -20,7 +20,8 @@ from pathlib import Path
 
 import pandas as pd
 
-ORDERS_CSV_PATH = Path("data") / "orders_history.csv"
+from core.runtime_paths import DATA_DIR
+ORDERS_CSV_PATH = DATA_DIR / "orders_history.csv"
 
 COLUMNS = [
     "order_id",

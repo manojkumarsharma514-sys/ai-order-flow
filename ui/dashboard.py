@@ -34,6 +34,23 @@ from controller.dashboard_controller import DashboardController
 from core.app_state import AppStateHandler
 
 
+# The compact Dashboard tab was laid out, pixel-for-pixel, assuming a
+# canvas around 1900x1000 (fixed-width table columns in ui/positions.py,
+# a fixed-width AIPanel, a Header QHBoxLayout with no wrap/scroll of its
+# own, etc.). None of those panels gracefully reflow below their design
+# width — the Header simply loses whatever falls past the window's right
+# edge (no scrollbar at all), and the AI Engine panel's scroll area had
+# its horizontal scrollbar explicitly disabled, so text past its
+# allotted width was silently truncated mid-word instead of being
+# reachable by scrolling. Rather than rewrite every panel to reflow
+# responsively, the practical fix is to stop the window from ever being
+# resized into a state those panels weren't designed for, and add a
+# scrollbar as a fallback for the one panel that can still get squeezed
+# by the splitter even at the minimum size.
+MIN_WINDOW_WIDTH = 1600
+MIN_WINDOW_HEIGHT = 900
+
+
 def _placeholder_page(name):
     page = QWidget()
     layout = QVBoxLayout(page)
@@ -51,6 +68,15 @@ class Dashboard(QMainWindow):
 
         self.setWindowTitle("AI OrderFlow Pro V10.0")
         self.resize(1900, 1000)
+
+        # Guards against the exact "screen stretch / clipped text" bug
+        # this fixes: dragging or restoring the window to something
+        # narrower than the dashboard's fixed-pixel panels need used to
+        # silently cut off content (Header's Balance/mode/clock, the AI
+        # Engine panel's labels) with no way to scroll and see it. A
+        # hard floor here means those panels always get at least the
+        # width they were designed for.
+        self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.setStyleSheet("""
         QMainWindow{
@@ -220,7 +246,15 @@ class Dashboard(QMainWindow):
         right_scroll = QScrollArea()
         right_scroll.setWidget(right_container)
         right_scroll.setWidgetResizable(True)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Fallback only — with the window's new minimum size (see
+        # MIN_WINDOW_WIDTH above) this pane should always get enough
+        # room to render without needing to scroll sideways. But if the
+        # splitter still ends up squeezing this pane below the AI
+        # panel's natural content width (e.g. the user drags the
+        # splitter handle manually), AsNeeded means that content
+        # becomes reachable by scrolling instead of being silently
+        # truncated mid-word with no way to see the rest at all.
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         right_scroll.setStyleSheet("QScrollArea{ background:#131722; border-left:1px solid #1E222D; }")
 
         top_splitter.addWidget(right_scroll)

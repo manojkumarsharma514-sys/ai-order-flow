@@ -8,22 +8,28 @@ last symbol/timeframe) to config/settings.json:
     - Default Leverage
     - Capital Allocation %  (used by the quick %-size buttons / auto-sizing)
     - Trade Risk %          (% of balance risked per auto-trade)
+    - Starting Paper Balance (what RESET BALANCE resets the paper
+      account back to — see ui/settings.py "Paper Account" section)
 
 plus the existing AI Auto Trading risk parameters already exposed in
 ui/settings.py, so "Save Settings" persists everything on that screen
 in one place.
 
 Separate from AppStateHandler on purpose: app_state.json changes on
-every close (it's "where you left off"), while settings.json only
-changes when the trader explicitly clicks "Save Settings" — a restart
-should never silently overwrite a preference the trader set on purpose.
+every close (it's "where you left off" — including the LIVE, currently
+fluctuating paper balance), while settings.json only changes when the
+trader explicitly clicks "Save Settings" — a restart should never
+silently overwrite a preference the trader set on purpose. This is
+exactly why Starting Paper Balance lives here and not in app_state.json:
+it's "what to reset TO", not "where things currently are".
 """
 
 import json
 import os
 from pathlib import Path
 
-SETTINGS_PATH = Path("config") / "settings.json"
+from core.runtime_paths import CONFIG_DIR
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
 
 DEFAULT_SETTINGS = {
     "default_leverage": 25,
@@ -34,6 +40,7 @@ DEFAULT_SETTINGS = {
     "default_take_profit_pct": 1.5,
     "min_ai_confidence_pct": 55,
     "cooldown_seconds": 20,
+    "starting_paper_balance": 10000.0,
 }
 
 

@@ -80,6 +80,7 @@ class DashboardController:
             symbol=self.paper_engine.symbol,
         )
         self.executor.auto_trade_executed.connect(self._on_auto_trade_executed)
+        self.executor.auto_trade_rejected.connect(self._on_auto_trade_rejected)
 
         self.dashboard.positions.close_all_clicked.connect(self.close_all_positions)
         self.dashboard.positions.reset_clicked.connect(self.reset_paper_account)
@@ -125,6 +126,7 @@ class DashboardController:
         # -------------------------------------------------------
         self.config_manager = ConfigManager()
         saved_settings = self.config_manager.load()
+        print(f"📂 Loaded settings.json — starting_paper_balance = {saved_settings.get('starting_paper_balance')!r}")
         self.dashboard.settings_tab.apply_settings(saved_settings)
         self._apply_settings_to_live_controls(saved_settings)
 
@@ -160,6 +162,11 @@ class DashboardController:
         self._latest_asks = []
         self._pending_trades = []  # [(side, price, size), ...] since last repaint
         self._dirty = False
+
+        # latest ATR(14), refreshed by update_indicators() each tick —
+        # fed into the executor so SL/TP can be ATR-based instead of a
+        # flat percentage (see trading/executor.py).
+        self._latest_atr = None
 
         event_bus.subscribe(self.on_market_update)
 
@@ -314,17 +321,28 @@ class DashboardController:
         except Exception as e:
             print("gauge update error:", e)
 
+        # ---- indicators (moved ahead of the executor call below so
+        # ATR is freshly computed before it's handed to the executor
+        # for ATR-based SL/TP — previously this ran *after* the
+        # executor, so evaluate() was always one tick stale on ATR) ----
+        self.update_indicators()
+
         # ---- AI Engine -> Executor bridge (auto-trading) ----
+        # Trades on market.confirmed_signal (persisted for several
+        # seconds — see core/orderflow_engine.py), not the raw
+        # per-tick market.signal, so a single noisy tick can no longer
+        # trigger an entry or a signal-flip on its own. ATR is passed
+        # through so the executor can set real ATR-based SL/TP instead
+        # of only ever exiting via signal flip.
         try:
             self.executor.evaluate(
-                signal=market.signal,
+                signal=getattr(market, "confirmed_signal", market.signal),
                 confidence=market.confidence,
                 price=self._latest_price,
+                atr=self._latest_atr,
             )
         except Exception as e:
             print("auto-trade executor error:", e)
-
-        self.update_indicators()
 
         # ---- positions ----
         self.refresh_positions()
@@ -510,7 +528,9 @@ class DashboardController:
 
     def reset_paper_account(self):
 
+        print(f"🔄 RESET BALANCE clicked — paper_engine.starting_balance is currently ${self.paper_engine.starting_balance:,.2f}")
         self.paper_engine.reset()
+        print(f"✅ Paper balance is now ${self.paper_engine.balance:,.2f}")
         self.refresh_positions()
 
     def _set_confidence_threshold(self, value: float):
@@ -546,6 +566,21 @@ class DashboardController:
         )
         self.executor.confidence_threshold = settings.get("min_ai_confidence_pct", self.executor.confidence_threshold)
         self.executor.cooldown_seconds = settings.get("cooldown_seconds", self.executor.cooldown_seconds)
+
+        # What RESET BALANCE resets the paper account back to. Doesn't
+        # touch the CURRENT balance by itself (that would silently
+        # change the account's live equity out from under an open
+        # session) — the trader clicks RESET BALANCE separately to
+        # actually apply it, same as changing SL/TP % doesn't retroactively
+        # edit an already-open position.
+        starting_balance = settings.get("starting_paper_balance")
+        if starting_balance:
+            self.paper_engine.starting_balance = starting_balance
+            print(f"🔧 paper_engine.starting_balance set to ${starting_balance:,.2f} (from settings)")
+        else:
+            print(f"⚠️ 'starting_paper_balance' missing/falsy in settings dict "
+                  f"(got: {settings.get('starting_paper_balance')!r}) — starting_balance "
+                  f"left at ${self.paper_engine.starting_balance:,.2f}")
 
     def _on_save_settings(self, settings: dict):
         self.config_manager.save(settings)
@@ -638,6 +673,21 @@ class DashboardController:
         except Exception as e:
             print(f"recent-trades render error (auto trade): {e}")
 
+    def _on_auto_trade_rejected(self, reason: str):
+        """AutoTradeExecutor evaluated a confirmed BUY/SELL signal but
+        did not trade it — either a hard broker-level rejection
+        (insufficient margin, notional over the leverage cap) or one
+        of the pre-trade gates skipping it (fee_unjustified,
+        confidence_below_threshold, flip_confidence_below_buffer,
+        min_hold_not_met). Surfaced in the Trade Setup panel's warning
+        banner so this is never invisible — previously only
+        discoverable by opening data/auto_trades_log.csv."""
+
+        try:
+            self.dashboard.trade_setup.show_rejection(f"AI Auto-Trade not executed: {reason}")
+        except Exception as e:
+            print(f"auto-trade rejection banner error: {e}")
+
     def _on_journal_notes_edited(self, trade_id, notes):
         try:
             self.journal_manager.update_notes(trade_id, notes)
@@ -715,6 +765,10 @@ class DashboardController:
             atr = calculate_atr(candles, period=14)
             trend_data = ema_trend(candles, fast=20, slow=50)
             vwap = calculate_vwap(candles)
+
+            # Cached for the executor bridge in refresh_ui() — ATR
+            # drives ATR-based SL/TP there instead of a flat percentage.
+            self._latest_atr = atr
 
             current_price = closes[-1]
 

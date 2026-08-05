@@ -23,7 +23,8 @@ import json
 import os
 from pathlib import Path
 
-APP_STATE_PATH = Path("config") / "app_state.json"
+from core.runtime_paths import CONFIG_DIR
+APP_STATE_PATH = CONFIG_DIR / "app_state.json"
 
 DEFAULT_STATE = {
     "auto_mode": True,
@@ -176,9 +177,17 @@ class AppStateHandler:
                 dashboard._on_indicator_toggled(code, code, True)
 
             # --- Paper balance / trading mode ---
-            controller.paper_engine.starting_balance = state.get(
-                "paper_balance", controller.paper_engine.starting_balance
-            )
+            # starting_balance is a preference owned by config/settings.json
+            # ("Starting Paper Balance" in the Settings tab, applied via
+            # ConfigManager -> DashboardController._apply_settings_to_live_controls
+            # at construction time, before restore_state ever runs). It must
+            # NOT be overwritten here — app_state.json only resumes the
+            # CURRENT balance from wherever the last session left off; it
+            # has no business deciding what a future RESET BALANCE targets.
+            # (Previously this also set starting_balance from the same
+            # "paper_balance" key, which silently reverted a trader's
+            # deliberately-configured Starting Paper Balance back to their
+            # last live balance on every relaunch.)
             controller.paper_engine.balance = state.get(
                 "paper_balance", controller.paper_engine.balance
             )

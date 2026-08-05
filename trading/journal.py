@@ -28,8 +28,9 @@ from pathlib import Path
 
 import pandas as pd
 
-JOURNAL_CSV_PATH = Path("data") / "trade_journal.csv"
-REPORTS_DIR = Path("data") / "reports"
+from core.runtime_paths import DATA_DIR
+JOURNAL_CSV_PATH = DATA_DIR / "trade_journal.csv"
+REPORTS_DIR = DATA_DIR / "reports"
 
 COLUMNS = [
     "trade_id",

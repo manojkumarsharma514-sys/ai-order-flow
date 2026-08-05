@@ -34,6 +34,37 @@ class OrderFlowEngine:
 
         self.signal="WAIT"
 
+        # ------------------------------------------------------------
+        # Signal persistence ("confirmed_signal")
+        # ------------------------------------------------------------
+        # `self.signal` above is recomputed from scratch on every single
+        # trade tick and can flip between STRONG BUY / WATCH / WAIT /
+        # ABSORPTION multiple times per second on a noisy tape — that's
+        # fine for the dashboard's live AI ENGINE readout, which
+        # repaints every tick anyway, but it's *not* fine for anything
+        # that only samples the signal periodically (AutoTradeExecutor
+        # is polled once every 250ms by the UI timer in
+        # controller/dashboard_controller.py). A STRONG BUY/SELL that's
+        # only "true" for one or two ticks (often well under 250ms on a
+        # fast tape) can flicker in and out between polls and simply
+        # never get seen by the executor at all — which is exactly what
+        # was happening: STRONG SELL fired in the raw engine, but
+        # data/auto_trades_log.csv never got a row for it, because by
+        # the time evaluate() ran, self.signal had already reverted.
+        #
+        # `confirmed_signal` fixes this: once an actionable signal
+        # (STRONG BUY / STRONG SELL) fires, it's HELD at that value for
+        # `signal_hold_seconds` seconds regardless of what self.signal
+        # does tick-to-tick in the meantime, giving a 250ms poller ~12
+        # chances to catch it before it reverts to WAIT. A *new*
+        # actionable signal (including the opposite direction) always
+        # immediately overrides and restarts the hold — it never masks
+        # a fresh flip, only bridges the gaps between an executor's
+        # polling interval and this engine's per-tick recompute.
+        self.confirmed_signal = "WAIT"
+        self.signal_hold_seconds = 3.0
+        self._last_actionable_signal_time = None
+
         self.price=0
 
         self.confidence=0
@@ -410,6 +441,13 @@ class OrderFlowEngine:
 
         )
 
+        # buy_score/sell_score are an unbounded sum of additive
+        # factors (up to 105 when every factor fires at once, as seen
+        # in the console log — e.g. "CONFIDENCE: 105%"). Clamped here
+        # so nothing downstream (gauges, the executor's confidence
+        # threshold/flip-buffer comparisons) ever sees a > 100 value.
+        confidence = min(confidence, 100)
+
 
 
         signal="WAIT"
@@ -461,7 +499,30 @@ class OrderFlowEngine:
 
         self.market_regime=self.smart_money
 
+        # ------------------------------------------------------------
+        # Update confirmed_signal — see the explanation in __init__.
+        # Only STRONG BUY / STRONG SELL are "actionable" here (matching
+        # AutoTradeExecutor.SIGNAL_SIDE_MAP); ABSORPTION/WATCH/WAIT are
+        # informational only and never drive a trade, so they don't
+        # extend or start a hold.
+        # ------------------------------------------------------------
 
+        now = time.time()
+        actionable = signal in ("🟢 STRONG BUY", "🔴 STRONG SELL")
+
+        if actionable:
+            self.confirmed_signal = signal
+            self._last_actionable_signal_time = now
+        elif (
+            self._last_actionable_signal_time is not None
+            and (now - self._last_actionable_signal_time) < self.signal_hold_seconds
+        ):
+            # still within the hold window — keep the previously
+            # confirmed signal so a slow poller doesn't miss it
+            pass
+        else:
+            self.confirmed_signal = "WAIT"
+            self._last_actionable_signal_time = None
 
 
         print(f"""
@@ -559,6 +620,11 @@ SIGNAL:
 
 
 {signal}
+
+
+CONFIRMED SIGNAL (held {self.signal_hold_seconds:.0f}s):
+
+{self.confirmed_signal}
 
 
 =================================

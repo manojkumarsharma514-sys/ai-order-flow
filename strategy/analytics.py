@@ -21,7 +21,8 @@ import pandas as pd
 
 from trading.orders import OrdersManager
 
-ANALYTICS_CSV_PATH = Path("data") / "analytics_summary.csv"
+from core.runtime_paths import DATA_DIR
+ANALYTICS_CSV_PATH = DATA_DIR / "analytics_summary.csv"
 
 EMPTY_METRICS = {
     "win_rate_pct": 0.0,
