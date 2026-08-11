@@ -27,6 +27,16 @@ class Position:
         self.exit_price = None
         self.realized_pnl = None
 
+        # AI confidence (0-100) at the moment this position was
+        # opened, when it was an AI_AUTO trade — None for manual
+        # trades, which never had a confidence reading. This is the
+        # baseline trading.exit_manager.ExitManager compares an
+        # incoming opposite-direction signal's confidence against
+        # (Phase 1: flip-confidence buffer) — set explicitly by
+        # PaperTradingEngine.open_position() right after construction,
+        # the same pattern already used for entry_fee below.
+        self.entry_confidence = None
+
         # Fees (spec: Delta Exchange fee + 18% GST, charged on both the
         # entry fill and the exit fill). entry_fee is set immediately by
         # PaperTradingEngine.open_position(); exit_fee/total_fee are set
@@ -110,4 +120,5 @@ class Position:
             "entry_fee": self.entry_fee,
             "exit_fee": self.exit_fee,
             "total_fee": self.total_fee,
+            "entry_confidence": self.entry_confidence,
         }

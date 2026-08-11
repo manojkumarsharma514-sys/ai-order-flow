@@ -18,36 +18,56 @@ AI AUTO TRADING is the switch that actually lets this class place
 orders. Both are wired in the controller so their behavior matches
 what the toggle switches visually communicate.
 
---------------------------------------------------------------------
-Anti-whipsaw / fee-awareness (added after the 12.5% win-rate / 21-loss
-session where every close_reason was "ai_signal_flip"):
+`evaluate()` takes `side` directly (from orderflow_engine.action_side,
+itself derived from confirmed_signal — not the raw per-tick signal),
+rather than re-deriving LONG/SHORT from a display string. This is the
+single source of truth that ui/ai_panel.py's Signal Factor Breakdown
+also renders from, so what the panel shows as "TRADING" is guaranteed
+to be exactly what this method evaluates — no second, independently
+re-parsed signal that can silently disagree with the screen.
 
-`evaluate()` now expects the CALLER to pass the *confirmed* signal
-(core.orderflow_engine market.confirmed_signal — persisted for several
-seconds, not the raw per-tick market.signal) so a single noisy tick
-can no longer trigger an entry or a flip on its own. On top of that,
-three independent gates apply before a flip is allowed:
+PHASE 1 (audit baseline: 87/99 trades closed via ai_signal_flip, median
+hold 4.27 min, fee drag = 76.5% of total loss): opposite-signal
+flip-closes are no longer unconditional. Every flip is routed through
+trading.exit_manager.ExitManager, which enforces a minimum hold time
+and a flip-confidence buffer before an existing AI_AUTO position is
+allowed to be closed in favor of a new opposite-direction one. A
+blocked flip leaves the existing position open and untouched — its
+Stop Loss / Take Profit continue to be enforced independently by
+PaperTradingEngine.mark_to_market() every tick, regardless of this
+class's decisions.
 
-  1. Fee justification — the take-profit target must clear round-trip
-     trading fees + assumed slippage by a safety margin
-     (fee_safety_multiplier). Rather than skipping the trade outright
-     when the ATR/pct-based target falls short (which, in a quiet/
-     Low-ATR market, could block every signal indefinitely), the TP
-     distance is floored at the minimum fee-justified distance instead
-     — the trade still fires, just with a wider, guaranteed-profitable
-     target.
-  2. Flip confidence buffer — reversing an existing AI_AUTO position
-     requires MORE confidence than opening one fresh
-     (confidence_threshold + flip_confidence_buffer). This is the
-     hysteresis band.
-  3. Minimum hold time — a position must have been open at least
-     min_hold_seconds before it's eligible to be flip-closed at all,
-     regardless of how confident the new signal is.
+PHASE 2 (follow-up audit on the 117-trade legacy cohort: Sideways EMA
+trend accounted for 62% of total loss at a 0% win rate; average gross
+move per trade, 0.027%, was smaller than the 0.118% round-trip fee
+cost; no daily loss limit or consecutive-loss circuit breaker existed
+anywhere in the codebase). Three additions, all entry-quality /
+risk-management gates rather than exit-timing changes (Phase 1 already
+handles exit timing):
 
-SL/TP are ATR-based when an `atr` value is supplied to evaluate()
-(a real stop/target instead of only ever exiting via signal flip),
-falling back to the existing fixed-percentage risk params otherwise.
---------------------------------------------------------------------
+    1. Regime filter — entries and flips are blocked outright while
+       the EMA 20/50 trend reads "Sideways" (see
+       block_sideways_regime / _regime_permits_entry).
+    2. Fee-edge filter — entries require the current ATR to imply a
+       typical move at least `min_atr_fee_multiple` times the
+       round-trip fee cost, so a trade has structural room to profit
+       net of fees before it's even opened (see _edge_clears_fees).
+    3. trading.risk_governor.RiskGovernor — a daily loss limit and a
+       max-consecutive-losses circuit breaker, checked at the top of
+       evaluate() before any other gate.
+
+PHASE 3 (tick engine has no concept of trend — a single ~465-point
+BTCUSD rally on 2026-08-11 produced 1,937 STRONG BUY and 2,686 STRONG
+SELL signal events from core.orderflow_engine, nearly evenly split
+fighting-vs-following the actual move, because it only reads the last
+~200 raw trades). trading.signal_gate.SignalGate requires a tick
+signal's direction to AGREE with the regime read from a completely
+separate, FIXED-timeframe candle feed (strategy.regime_engine.
+RegimeEngine — always 1H, never the chart's display timeframe) before
+it's considered at all. Checked immediately after `side` is confirmed
+actionable, ahead of confidence/cooldown/Sideways/fee-edge — regime
+alignment is now the primary filter on tick-engine noise, not a
+downstream cleanup gate.
 """
 
 import csv
@@ -56,15 +76,22 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from trading.exit_manager import ExitManager
+from trading.risk_governor import RiskGovernor
+from trading.signal_gate import SignalGate
 from trading.fees import TAKER_FEE_RATE, GST_RATE
 
 AUTO_TRADES_LOG_PATH = Path("data") / "auto_trades_log.csv"
 
+# Round-trip cost as a % of notional: taker fee, doubled for entry +
+# exit legs, with GST applied on top of each leg — matches
+# trading/fees.py exactly (0.05% x 1.18 x 2 = 0.118%).
+ROUND_TRIP_FEE_PCT = TAKER_FEE_RATE * (1 + GST_RATE) * 2 * 100
+
 LOG_COLUMNS = ["timestamp", "symbol", "signal", "side", "price", "qty", "status", "reason"]
 
-# core.orderflow_engine signal strings -> trade side. Anything not in
-# this map (WAIT, ABSORPTION, WATCH *) is treated as "no action" so the
-# bot only trades on its highest-conviction reads.
+# Map the controller's confirmed display signal into the executor's
+# normalized internal position side.
 SIGNAL_SIDE_MAP = {
     "🟢 STRONG BUY": "LONG",
     "🔴 STRONG SELL": "SHORT",
@@ -74,11 +101,19 @@ SIGNAL_SIDE_MAP = {
 class AutoTradeExecutor(QObject):
 
     auto_trade_executed = pyqtSignal(dict)  # {side, price, qty, status, reason, ...}
-    auto_trade_rejected = pyqtSignal(str)   # human-readable rejection reason
+    # Lets the dashboard show why an otherwise valid auto-trade could
+    # not be opened, rather than failing silently after a paper-engine
+    # margin or validation rejection.
+    auto_trade_rejected = pyqtSignal(str)
 
     def __init__(self, paper_engine, symbol="BTCUSD",
                  confidence_threshold=55, cooldown_seconds=20,
-                 log_path: Path = AUTO_TRADES_LOG_PATH):
+                 log_path: Path = AUTO_TRADES_LOG_PATH,
+                 exit_manager: ExitManager = None,
+                 risk_governor: RiskGovernor = None,
+                 signal_gate: SignalGate = None,
+                 min_atr_fee_multiple: float = 1.5,
+                 block_sideways_regime: bool = True):
         super().__init__()
 
         self.paper_engine = paper_engine
@@ -87,20 +122,40 @@ class AutoTradeExecutor(QObject):
         self.cooldown_seconds = cooldown_seconds
         self.log_path = Path(log_path)
 
+        # Phase 1 gate — injectable so tests/config can supply a
+        # pre-configured instance; otherwise builds one from
+        # environment variables / class defaults (see
+        # trading/exit_manager.py: MIN_HOLD_MINUTES, FLIP_CONFIDENCE_DELTA).
+        self.exit_manager = exit_manager or ExitManager()
+
+        # Phase 2 gate 3 — daily loss limit + consecutive-loss circuit
+        # breaker (see trading/risk_governor.py). Wired directly to
+        # PaperTradingEngine's close-listener list so it sees every
+        # position close (manual, SL/TP, or AI_AUTO) the same way
+        # Orders/Journal already do — no controller changes needed for
+        # the closing side of this gate.
+        self.risk_governor = risk_governor or RiskGovernor()
+        self.paper_engine.add_close_listener(self.risk_governor.on_position_closed)
+
+        # PHASE 3 gate — requires the tick engine's confirmed signal to
+        # agree with the fixed-timeframe regime (see
+        # trading/signal_gate.py + strategy/regime_engine.py) before
+        # it's considered at all. Runs earliest of the entry-quality
+        # gates, ahead of confidence/cooldown/Sideways/fee-edge — see
+        # evaluate() below.
+        self.signal_gate = signal_gate or SignalGate()
+
+        # Phase 2 gates 1 & 2 — configurable via Settings (pushed in by
+        # DashboardController._apply_settings_to_live_controls, same
+        # pattern as leverage/margin_pct below) or the constructor
+        # defaults here.
+        self.min_atr_fee_multiple = min_atr_fee_multiple
+        self.block_sideways_regime = block_sideways_regime
+
         self.enabled = True          # driven by AI AUTO TRADING toggle
         self.trading_paused = False  # driven by Stop Bot / AUTO MODE off, if desired
 
         self._last_trade_time = None
-
-        # Dedup for _skip()'s banner emission — the same skip reason
-        # can otherwise fire on every single 250ms evaluate() tick for
-        # as long as confirmed_signal holds (up to signal_hold_seconds
-        # in core.orderflow_engine, ~12 ticks), which used to spam the
-        # UI banner with identical text repeatedly. Every skip is still
-        # logged to CSV every time (full audit trail); only the UI
-        # emission is deduped to once per reason-change.
-        self._last_skip_reason = None
-
         self._risk_params = {
             # "size" is no longer used to place orders (see
             # _calculate_position_size) — kept only as a manual-override
@@ -110,7 +165,8 @@ class AutoTradeExecutor(QObject):
             "take_profit_pct": 1.5,
         }
 
-        # Dynamic Position Sizing:
+        # Dynamic Position Sizing (previously hardcoded to size=1.0 on
+        # every auto-trade regardless of account balance):
         #
         #   Total Purchasing Power = Balance x Leverage
         #   Allocated Capital ($)  = Purchasing Power x Margin Usage %
@@ -119,33 +175,6 @@ class AutoTradeExecutor(QObject):
         # Defaults match the spec: 25x leverage, 50% margin usage.
         self.leverage = 25
         self.margin_pct = 0.50
-
-        # ------------------------------------------------------------
-        # Anti-whipsaw / fee-awareness controls
-        # ------------------------------------------------------------
-
-        # A position must have been open at least this long before an
-        # opposite signal is even allowed to flip it.
-        self.min_hold_seconds = 90
-
-        # Hysteresis band: reversing an existing AI_AUTO position needs
-        # MORE conviction than opening one fresh. e.g. threshold=75,
-        # buffer=10 -> opening needs 75%, flipping needs 85%.
-        self.flip_confidence_buffer = 10
-
-        # Projected TP profit must be at least this multiple of
-        # round-trip fees + assumed slippage before ANY entry (flip or
-        # fresh) is allowed to fire.
-        self.fee_safety_multiplier = 1.5
-
-        # Assumed one-way slippage in basis points, applied on both fills.
-        self.slippage_bps = 5
-
-        # ATR-based SL/TP multipliers, used when evaluate() is given an
-        # `atr` value. Falls back to the pct-based risk params above
-        # when ATR isn't available yet (e.g. not enough candles).
-        self.atr_sl_multiplier = 1.5
-        self.atr_tp_multiplier = 3.0
 
         self._ensure_log_file()
 
@@ -169,24 +198,6 @@ class AutoTradeExecutor(QObject):
             self.margin_pct = max(0.0, min(1.0, float(pct))) if pct else 0.50
         except (TypeError, ValueError):
             self.margin_pct = 0.50
-
-    def set_min_hold_seconds(self, seconds):
-        try:
-            self.min_hold_seconds = max(0, int(seconds))
-        except (TypeError, ValueError):
-            pass
-
-    def set_flip_confidence_buffer(self, buffer_pct):
-        try:
-            self.flip_confidence_buffer = max(0.0, float(buffer_pct))
-        except (TypeError, ValueError):
-            pass
-
-    def set_fee_safety_multiplier(self, multiplier):
-        try:
-            self.fee_safety_multiplier = max(1.0, float(multiplier))
-        except (TypeError, ValueError):
-            pass
 
     def calculate_position_size(self, price: float) -> float:
         """
@@ -219,154 +230,268 @@ class AutoTradeExecutor(QObject):
         if take_profit_pct is not None:
             self._risk_params["take_profit_pct"] = take_profit_pct
 
-    # ------------------------------------------------------------
-    # SL/TP calculation — ATR-based when available, percentage-based
-    # fallback otherwise.
-    # ------------------------------------------------------------
+    def set_min_atr_fee_multiple(self, value: float):
+        try:
+            self.min_atr_fee_multiple = max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
 
-    def _atr_based_sl_tp(self, price, atr, side):
-        sl_dist = atr * self.atr_sl_multiplier
-        tp_dist = atr * self.atr_tp_multiplier
+    def set_block_sideways_regime(self, value: bool):
+        self.block_sideways_regime = bool(value)
 
-        if side == "LONG":
-            return price - sl_dist, price + tp_dist
-        return price + sl_dist, price - tp_dist
-
-    def _pct_based_sl_tp(self, price, side, sl_pct, tp_pct):
-        if side == "LONG":
-            return price * (1 - sl_pct), price * (1 + tp_pct)
-        return price * (1 + sl_pct), price * (1 - tp_pct)
+    def set_signal_gate_enabled(self, value: bool):
+        self.signal_gate.set_enabled(value)
 
     # ------------------------------------------------------------
-    # Fee-awareness: the take-profit target must clear round-trip
-    # trading fees + assumed slippage by a safety margin, or the trade
-    # is structurally unprofitable before price even moves.
-    #
-    # NOTE: this is scale-invariant — both the projected profit
-    # (tp_dist * qty) and the cost (notional_rate * price * qty) scale
-    # linearly with qty, so position size/leverage never affects
-    # whether a trade clears this bar. It's purely a function of how
-    # wide tp_dist is relative to price. In a "Low ATR" market (see
-    # DashboardController.update_indicators — ATR < 0.1% of price),
-    # even 3x ATR tops out under the ~0.33% round-trip-cost-plus-buffer
-    # bar, which used to SKIP every single signal in quiet conditions.
-    # Instead of skipping the trade outright, the TP distance is
-    # floored at the minimum fee-justified distance — still anchored
-    # to ATR/pct when that's already wide enough, only widened when it
-    # would otherwise guarantee a loss after costs.
+    # PHASE 2 gate helpers
     # ------------------------------------------------------------
 
-    def _min_tp_distance_for_fees(self, price):
-        """Minimum |take_profit - entry| distance (in price terms) that
-        clears round-trip taker fees + GST + assumed slippage by
-        `fee_safety_multiplier`. Independent of position size."""
+    def _regime_permits_entry(self, ema_trend: str) -> bool:
+        """Blocks both fresh entries and flip-driven re-entries while
+        the EMA 20/50 trend reads Sideways — the audit found this
+        regime accounted for 62% of legacy total loss at a 0% win
+        rate. `ema_trend` degrades gracefully: None/"--"/unknown
+        values are treated as "not confirmed Sideways" (permitted),
+        since blocking on missing data would stop trading entirely
+        before enough candles exist."""
 
-        round_trip_fee_rate = TAKER_FEE_RATE * (1 + GST_RATE) * 2  # entry fill + exit fill
-        slippage_rate = (self.slippage_bps / 10000) * 2            # entry fill + exit fill
+        if not self.block_sideways_regime:
+            return True
+        return str(ema_trend or "").strip().lower() != "sideways"
 
-        total_rate = round_trip_fee_rate + slippage_rate
-        return price * total_rate * self.fee_safety_multiplier
+    def _edge_clears_fees(self, atr: float, price: float) -> bool:
+        """Requires the current ATR (as a % of price) to imply a
+        typical move at least `min_atr_fee_multiple` x the round-trip
+        fee cost. Audit finding: average gross move per trade (0.027%)
+        was smaller than the round-trip fee (0.118%) — trades were
+        structurally unable to clear their own costs regardless of
+        directional accuracy. Fails OPEN (permits the trade) when ATR
+        isn't yet available, consistent with how the ATR-based SL/TP
+        below already degrades to the flat-percentage fallback rather
+        than blocking all trading during candle warm-up."""
 
-    def _apply_fee_floor(self, price, side, take_profit):
-        """Widen take_profit (if needed) so it clears the fee floor
-        above. Never tightens an already-wide ATR/pct-based target."""
+        if self.min_atr_fee_multiple <= 0:
+            return True
+        if not atr or not price or price <= 0:
+            return True  # ATR not ready yet — fail open, not closed
 
-        min_dist = self._min_tp_distance_for_fees(price)
-        current_dist = abs(take_profit - price) if take_profit else 0.0
-
-        if current_dist >= min_dist:
-            return take_profit
-
-        return price + min_dist if side == "LONG" else price - min_dist
+        atr_pct = (atr / price) * 100
+        return atr_pct >= (ROUND_TRIP_FEE_PCT * self.min_atr_fee_multiple)
 
     # ------------------------------------------------------------
     # Main entry point — called once per UI refresh tick from the
-    # DashboardController, with the latest AI Engine readout.
-    #
-    # IMPORTANT: pass the CONFIRMED signal (core.orderflow_engine
-    # market.confirmed_signal), not the raw per-tick market.signal —
-    # see controller/dashboard_controller.py update_indicators()/
-    # refresh_ui(). `atr` is optional; when supplied, SL/TP are
-    # ATR-based instead of fixed percentages.
+    # DashboardController, with the engine's canonical action decision.
     # ------------------------------------------------------------
 
-    def evaluate(self, signal: str, confidence: float, price: float, atr: float = None):
+    def evaluate(self, side: str = None, confidence: float = 0.0,
+                 price: float = None, signal_label: str = "",
+                 indicators_ready: bool = True, *, signal: str = None,
+                 atr: float = None, ema_trend: str = None):
+        """
+        side:              "LONG" | "SHORT" | None — MUST come from
+                            orderflow_engine.action_side (derived from
+                            confirmed_signal, not the raw per-tick
+                            signal). Never re-derive this from a
+                            display string inside this method.
+        confidence:        orderflow_engine.confidence (raw float, not
+                            the UI's rounded/truncated display value).
+        price:              latest traded price.
+        signal_label:      human-readable signal string, used only for
+                            the CSV audit log — never for decisions.
+        indicators_ready:  EXPLICIT guard. orderflow_engine only sets
+                            its own indicators_ready=True once it has
+                            received at least one real VWAP/RSI/ATR
+                            reading from the controller (which itself
+                            waits for >=15 candles before calling in).
+                            Checked explicitly here so the protection
+                            can't be silently lost by a future refactor
+                            that calls evaluate() from a different code
+                            path.
+        ema_trend:         PHASE 2 — "Uptrend" / "Downtrend" / "Sideways"
+                            / None, from strategy.trend.ema_trend (the
+                            controller passes its cached
+                            self._latest_ema_trend). Used by the
+                            Sideways-regime gate below.
+        """
+
+        # The controller currently passes signal=confirmed_signal. Keep
+        # the executor compatible with that call while using LONG/SHORT
+        # internally for all position decisions.
+        if signal is not None:
+            signal_label = signal
+            side = SIGNAL_SIDE_MAP.get(str(signal).strip())
+
+        if not indicators_ready:
+            self._log_event(signal_label, side or "NONE", price, qty=0,
+                             status="SKIPPED", reason="indicators_not_ready")
+            return
 
         if not self.enabled or self.trading_paused:
+            return
+
+        # ------------------------------------------------------------
+        # PHASE 2, gate 3: daily loss limit + consecutive-loss circuit
+        # breaker. Checked before anything else that could open a new
+        # position — a tripped breaker blocks ALL new AI_AUTO entries
+        # and flips for the rest of the trading day, but never touches
+        # already-open positions (their SL/TP keep running normally
+        # via PaperTradingEngine.mark_to_market()).
+        # ------------------------------------------------------------
+        governor_decision = self.risk_governor.trading_allowed()
+        if not governor_decision.allowed:
+            self._log_event(signal_label, side or "NONE", price, qty=0,
+                             status="SKIPPED", reason=governor_decision.reason)
+            self.auto_trade_rejected.emit(
+                f"{governor_decision.reason} (daily_pnl={governor_decision.daily_pnl_usd:.2f}, "
+                f"consecutive_losses={governor_decision.consecutive_losses})"
+            )
             return
 
         if price is None or price <= 0:
             return
 
-        side = SIGNAL_SIDE_MAP.get(signal)
-        if side is None:
-            return  # WAIT / WATCH / ABSORPTION / unconfirmed — not a high-conviction signal
+        if side not in ("LONG", "SHORT"):
+            return  # not a confirmed, actionable signal (WAIT / WATCH / ABSORPTION / None)
+
+        # ------------------------------------------------------------
+        # PHASE 3: SignalGate — regime is now the FIRST filter, not an
+        # afterthought applied to the tick engine's raw output. See
+        # trading/signal_gate.py. `ema_trend` here is sourced from
+        # strategy.regime_engine.RegimeEngine via the controller — a
+        # FIXED timeframe, independent of the chart's own display
+        # timeframe and independent of the tick-based signal itself.
+        # A signal fighting the higher-timeframe trend (or firing
+        # during a Sideways regime) is rejected here, before it ever
+        # reaches the confidence/cooldown/fee-edge gates below.
+        # ------------------------------------------------------------
+        gate_decision = self.signal_gate.evaluate(side=side, regime=ema_trend)
+        if not gate_decision.allowed:
+            self._log_event(signal_label, side, price, qty=0,
+                             status="SKIPPED", reason=gate_decision.reason)
+            self.auto_trade_rejected.emit(
+                f"Entry blocked — {side} signal disagrees with regime "
+                f"({ema_trend or 'unknown'})"
+            )
+            return
 
         if confidence < self.confidence_threshold:
-            self._skip(signal, side, price, qty=0, reason="confidence_below_threshold")
+            self._log_event(signal_label, side, price, qty=0, status="SKIPPED", reason="confidence_below_threshold")
             return
 
         if self._in_cooldown():
+            return
+
+        # ------------------------------------------------------------
+        # PHASE 2, gates 1 & 2: regime filter + fee-edge filter.
+        # Applied to ANY new-position-opening path below — a fresh
+        # entry or a flip-driven re-entry — since both are the same
+        # underlying decision ("is this a good place to be positioned
+        # at all"), and the audit found this to be the actual
+        # bottleneck once Phase 1 stopped the whipsaw churn: entries
+        # were structurally fine on R:R but concentrated in a 0%-win
+        # regime and priced without regard to whether a typical move
+        # could even clear the round-trip fee.
+        # ------------------------------------------------------------
+        if not self._regime_permits_entry(ema_trend):
+            self._log_event(signal_label, side, price, qty=0,
+                             status="SKIPPED", reason="regime_sideways_blocked")
+            self.auto_trade_rejected.emit(
+                f"Entry blocked — EMA trend is Sideways (confidence {confidence:.0f}%)"
+            )
+            return
+
+        if not self._edge_clears_fees(atr, price):
+            self._log_event(signal_label, side, price, qty=0,
+                             status="SKIPPED", reason="expected_move_below_fee_floor")
+            self.auto_trade_rejected.emit(
+                f"Entry blocked — ATR-implied move too small to clear round-trip fees "
+                f"(need >={self.min_atr_fee_multiple:.1f}x {ROUND_TRIP_FEE_PCT:.3f}%)"
+            )
             return
 
         # avoid stacking multiple auto positions in the same direction
         if any(p.source == "AI_AUTO" and p.side == side for p in self.paper_engine.positions):
             return
 
+        # ------------------------------------------------------------
+        # PHASE 1: opposite-direction flip gate
+        # ------------------------------------------------------------
+        # A STRONG BUY and STRONG SELL signal can both fire within a
+        # session as the tape flips. Previously this loop closed the
+        # opposite-side AI_AUTO position unconditionally and always
+        # proceeded to open the new one — that unconditional flip is
+        # exactly what produced 87/99 trades exiting via
+        # ai_signal_flip at a 4.27-minute median hold (audit baseline).
+        #
+        # Now: every opposite-side AI_AUTO position is routed through
+        # ExitManager.evaluate_flip(), which enforces a minimum hold
+        # time and a flip-confidence buffer. If EITHER gate blocks the
+        # flip, this method returns immediately WITHOUT closing the
+        # existing position and WITHOUT opening the new one — the
+        # reversal signal is ignored outright, per spec ("ignore the
+        # reversal signal and retain the current open position").
+        # Stop Loss / Take Profit on the retained position are
+        # completely unaffected: they're enforced independently by
+        # PaperTradingEngine.mark_to_market() on every tick regardless
+        # of what happens here.
         opposite_side = "SHORT" if side == "LONG" else "LONG"
-        opposite_positions = [
-            p for p in self.paper_engine.positions
-            if p.source == "AI_AUTO" and p.side == opposite_side
-        ]
+        blocking_position = next(
+            (p for p in self.paper_engine.positions
+             if p.source == "AI_AUTO" and p.side == opposite_side),
+            None,
+        )
+
+        if blocking_position is not None:
+            decision = self.exit_manager.evaluate_flip(
+                position=blocking_position,
+                new_side=side,
+                new_confidence=confidence,
+            )
+
+            if not decision.allowed:
+                self._log_event(signal_label, side, price, qty=0,
+                                 status="SKIPPED", reason=decision.reason)
+                self.auto_trade_rejected.emit(
+                    f"Flip blocked ({decision.reason}) — keeping existing "
+                    f"{blocking_position.side} position open"
+                )
+                return  # existing position stays open exactly as-is; SL/TP untouched
+
+            # Gates cleared — proceed with the flip.
+            self.paper_engine.close_position(blocking_position.id, reason="ai_signal_flip")
 
         size = self.calculate_position_size(price)
         sl_pct = self._risk_params["stop_loss_pct"] / 100
         tp_pct = self._risk_params["take_profit_pct"] / 100
 
-        if atr is not None and atr > 0:
-            stop_loss, take_profit = self._atr_based_sl_tp(price, atr, side)
-        else:
-            stop_loss, take_profit = self._pct_based_sl_tp(price, side, sl_pct, tp_pct)
-
-        # Gate 1 (was a hard skip — "fee_unjustified" — that blocked
-        # every signal in a quiet/Low-ATR market, since 3x ATR often
-        # can't clear round-trip fees on its own). Now: widen the TP
-        # to the minimum fee-justified distance instead of skipping
-        # the trade outright. Only widens when the ATR/pct-based
-        # target would otherwise guarantee a loss after costs; a
-        # target that already clears the bar is left untouched.
-        take_profit = self._apply_fee_floor(price, side, take_profit)
-
-        if opposite_positions:
-            # Gate 2: reversing needs MORE conviction than opening
-            # fresh — the hysteresis band that stops a signal wobbling
-            # around the threshold from flip-flopping.
-            if confidence < self.confidence_threshold + self.flip_confidence_buffer:
-                self._skip(signal, side, price, qty=0, reason="flip_confidence_below_buffer")
-                return
-
-            # Gate 3: minimum hold time — a position just opened can't
-            # be immediately reversed no matter how confident the new
-            # signal is.
-            stale_enough = all(
-                (datetime.now() - p.opened_at).total_seconds() >= self.min_hold_seconds
-                for p in opposite_positions
-            )
-            if not stale_enough:
-                self._skip(signal, side, price, qty=0, reason="min_hold_not_met")
-                return
-
-            # All gates passed — close the opposite-direction AI_AUTO
-            # position(s) first, then open the new one below. Without
-            # this, the bot would end up holding a LONG and a SHORT on
-            # the same symbol at once (self-hedging: real losses on
-            # both legs to spread/fees with no net exposure).
-            for p in opposite_positions:
-                self.paper_engine.close_position(p.id, reason="ai_signal_flip")
-
         # Keep the engine's margin-check cap in step with the leverage
-        # this size was actually calculated against.
+        # this size was actually calculated against — otherwise a
+        # dynamically-sized order at, say, 100x can get rejected by a
+        # stale lower cap left over from a previous setting.
         self.paper_engine.max_leverage = self.leverage
+
+        # Use volatility-scaled exits where ATR is available. The fixed
+        # percentage values remain the startup fallback before ATR exists.
+        try:
+            atr_value = float(atr) if atr is not None else 0.0
+        except (TypeError, ValueError):
+            atr_value = 0.0
+
+        if atr_value > 0:
+            stop_distance = atr_value * 1.5
+            target_distance = atr_value * 3.0  # 1:2 gross R:R
+            if side == "LONG":
+                stop_loss = price - stop_distance
+                take_profit = price + target_distance
+            else:
+                stop_loss = price + stop_distance
+                take_profit = price - target_distance
+        elif side == "LONG":
+            stop_loss = price * (1 - sl_pct)
+            take_profit = price * (1 + tp_pct)
+        else:
+            stop_loss = price * (1 + sl_pct)
+            take_profit = price * (1 - tp_pct)
 
         position = self.paper_engine.open_position(
             side=side,
@@ -375,55 +500,32 @@ class AutoTradeExecutor(QObject):
             stop_loss=stop_loss,
             take_profit=take_profit,
             source="AI_AUTO",
+            entry_confidence=confidence,  # baseline for this position's own future flip-confidence check
         )
 
         if position is None:
             reason = self.paper_engine.last_rejection or "unknown"
             self._log_event(
-                signal, side, price, qty=size, status="REJECTED",
+                signal_label, side, price, qty=size, status="REJECTED",
                 reason=reason,
             )
-            if reason != self._last_skip_reason:
-                self._last_skip_reason = reason
-                self.auto_trade_rejected.emit(reason)
+            self.auto_trade_rejected.emit(reason)
             return
 
-        # Cooldown only starts once a trade actually fills — a rejected
-        # order (insufficient margin, notional over the leverage cap,
-        # etc.) must not lock the bot out of trading for
-        # cooldown_seconds while a STRONG BUY/SELL signal sits untraded.
+        # A rejected order must not consume the entry cooldown.
         self._last_trade_time = datetime.now()
-        self._last_skip_reason = None  # fresh state — next skip (if any) always shows
 
-        self._log_event(signal, side, price, qty=size, status="EXECUTED", reason="ai_signal")
+        self._log_event(signal_label, side, price, qty=size, status="EXECUTED", reason="ai_signal")
 
         self.auto_trade_executed.emit({
             "side": side,
             "price": price,
             "qty": size,
             "status": "EXECUTED",
-            "signal": signal,
+            "signal": signal_label,
             "confidence": confidence,
             "position_id": position.id,
         })
-
-    def _skip(self, signal, side, price, qty, reason):
-        """Log + surface a gate skip (confidence below threshold,
-        flip-buffer not met, min-hold not met). Previously these only
-        wrote to data/auto_trades_log.csv, so a STRONG BUY/SELL signal
-        that never traded looked like a mystery from the dashboard —
-        this makes every skip reason visible immediately, the same as
-        a hard broker-level REJECTED. The CSV row is written every
-        single time (full audit trail); the UI banner emission is
-        deduped so an unchanged reason repeating tick after tick
-        doesn't spam the same message over and over."""
-
-        self._log_event(signal, side, price, qty=qty, status="SKIPPED", reason=reason)
-
-        if reason != self._last_skip_reason:
-            self._last_skip_reason = reason
-            self.auto_trade_rejected.emit(reason)
-        self.auto_trade_rejected.emit(reason)
 
     def _in_cooldown(self) -> bool:
         if self._last_trade_time is None:

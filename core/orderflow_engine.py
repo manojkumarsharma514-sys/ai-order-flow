@@ -65,6 +65,17 @@ class OrderFlowEngine:
         self.signal_hold_seconds = 3.0
         self._last_actionable_signal_time = None
 
+        # The confidence reading that was true AT THE MOMENT
+        # confirmed_signal was last set to an actionable value — held
+        # alongside it so a poller sampling confirmed_signal mid-hold
+        # window doesn't pair "STRONG BUY from 2 seconds ago" with
+        # "confidence right now", which can (and does) decay below any
+        # threshold in the interim. self.confidence below still updates
+        # every tick for the live gauges/UI; this is the frozen
+        # counterpart that belongs with confirmed_signal and is what
+        # AutoTradeExecutor.evaluate() should be reading.
+        self.confirmed_confidence = 0
+
         self.price=0
 
         self.confidence=0
@@ -512,16 +523,20 @@ class OrderFlowEngine:
 
         if actionable:
             self.confirmed_signal = signal
+            self.confirmed_confidence = confidence
             self._last_actionable_signal_time = now
         elif (
             self._last_actionable_signal_time is not None
             and (now - self._last_actionable_signal_time) < self.signal_hold_seconds
         ):
             # still within the hold window — keep the previously
-            # confirmed signal so a slow poller doesn't miss it
+            # confirmed signal AND the confidence that went with it, so
+            # a slow poller doesn't miss the signal, and doesn't pair it
+            # with an already-decayed live confidence reading either.
             pass
         else:
             self.confirmed_signal = "WAIT"
+            self.confirmed_confidence = 0
             self._last_actionable_signal_time = None
 
 

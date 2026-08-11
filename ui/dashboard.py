@@ -213,6 +213,8 @@ class Dashboard(QMainWindow):
 
         # Native Footprint Chart
         self.chart = FootprintChart()
+        # Keep the chart synchronized with TimeframeSelector default (15m).
+        self.chart.set_timeframe("15m")
         
         # Connect Timeframe selection to chart
         if hasattr(self.timeframe, 'timeframe_changed'):
@@ -318,6 +320,18 @@ class Dashboard(QMainWindow):
         return page
 
     def _on_timeframe_changed(self, tf):
-        """Pass selected timeframe to chart for proper candle aggregation & timeline scaling."""
+        """Keep the native chart timeframe synchronized with the selector."""
         if hasattr(self.chart, 'set_timeframe'):
             self.chart.set_timeframe(tf)
+        elif hasattr(self.chart, 'change_timeframe'):
+            # Backward-compatible fallback for older FootprintChart versions.
+            tf_seconds = {
+                "1m": 60,
+                "5m": 300,
+                "15m": 900,
+                "1H": 3600,
+                "4H": 14400,
+                "1D": 86400,
+            }.get(tf)
+            if tf_seconds is not None:
+                self.chart.change_timeframe(tf_seconds)

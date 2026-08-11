@@ -71,7 +71,15 @@ class PaperTradingEngine:
     # ------------------------------------------------------------
 
     def open_position(self, side, size, entry_price, stop_loss=None,
-                       take_profit=None, source="MANUAL"):
+                       take_profit=None, source="MANUAL", entry_confidence=None):
+        """
+        entry_confidence: AI confidence (0-100) at the moment of entry,
+        for AI_AUTO trades — passed straight through by
+        AutoTradeExecutor.evaluate() so trading.exit_manager.ExitManager
+        has a baseline to compare a later opposite-signal's confidence
+        against (Phase 1 flip-confidence buffer). None for manual
+        trades, which have no AI confidence reading.
+        """
 
         if size <= 0 or entry_price <= 0:
             self.last_rejection = "Enter a valid size and entry price"
@@ -121,6 +129,7 @@ class PaperTradingEngine:
             source=source,
         )
         position.entry_fee = entry_fee
+        position.entry_confidence = entry_confidence
 
         # NOTE: entry_fee is computed and stored on the position now
         # (so it's known/reportable immediately), but not subtracted
@@ -171,7 +180,13 @@ class PaperTradingEngine:
 
     def mark_to_market(self, price):
         """Update every open position's mark price and auto-close any
-        that have hit their stop loss or take profit."""
+        that have hit their stop loss or take profit.
+
+        This runs independently of ExitManager / AI signal evaluation
+        — SL/TP enforcement is unconditional and unaffected by whether
+        a flip was blocked or approved elsewhere. A position that
+        ExitManager keeps open (min-hold or confidence-buffer block)
+        still hits its stop/target normally right here."""
 
         try:
             price = float(price)

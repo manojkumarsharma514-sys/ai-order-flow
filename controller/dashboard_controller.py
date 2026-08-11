@@ -3,13 +3,14 @@ import time
 from PyQt6.QtCore import QTimer
 
 from core.orderflow_engine import orderflow_engine as market
-from core.candle_engine import CandleManager, aggregate_volume_profile
+from core.candle_engine import CandleManager, aggregate_volume_profile, calculate_dynamic_tick_size
 from core.websocket_thread import HistoryFetchThread
 from core import event_bus
 
 from strategy.indicators import calculate_rsi, calculate_atr, calculate_vwap
 from strategy.trend import ema_trend
 from strategy.analytics import AnalyticsEngine
+from strategy.regime_engine import RegimeEngine, STRATEGY_TIMEFRAME_SECONDS, STRATEGY_RESOLUTION
 
 from trading.paper_trading import PaperTradingEngine
 from trading.orders import OrdersManager
@@ -49,6 +50,25 @@ class DashboardController:
 
         # single rolling footprint candle series feeding the chart
         self.candle_manager = CandleManager(timeframe_seconds=300, tick_size=5.0)
+
+        # SEPARATE, fixed-timeframe candle series feeding trading
+        # decisions (regime + ATR) — deliberately NOT the same instance
+        # as self.candle_manager above, and NOT affected by the chart's
+        # TimeframeSelector. See strategy/regime_engine.py for the full
+        # rationale (fixes the bug where switching the chart to 4H
+        # silently inflated ATR-based SL/TP and loosened the fee-edge
+        # gate — see data/auto_trades_log.csv, 2026-08-11 ~15:11).
+        self.strategy_candle_manager = CandleManager(
+            timeframe_seconds=STRATEGY_TIMEFRAME_SECONDS,
+            tick_size=calculate_dynamic_tick_size(STRATEGY_TIMEFRAME_SECONDS),
+        )
+        self.regime_engine = RegimeEngine(self.strategy_candle_manager)
+        # cached each UI tick by refresh_ui(), read by the executor
+        # bridge and available for any future regime-aligned signal
+        # gating on top of the existing tick engine.
+        self._strategy_regime = None
+        self._strategy_atr = None
+        self._strategy_history_thread = None
 
         # simulated-only paper trading engine (no real orders are ever sent)
         self.paper_engine = PaperTradingEngine(starting_balance=10000.0)
@@ -137,6 +157,19 @@ class DashboardController:
         except Exception as e:
             print(f"statusbar symbol init error: {e}")
 
+        # Backfill the fixed-timeframe strategy candle series on
+        # startup, same mechanism change_timeframe() already uses for
+        # the chart — a background REST fetch so it never blocks the
+        # GUI thread. Regime/ATR stay None (fail-open in the executor's
+        # gates) until this lands or enough live 1H candles accumulate.
+        self._strategy_history_thread = HistoryFetchThread(
+            symbol=self.paper_engine.symbol,
+            resolution=STRATEGY_RESOLUTION,
+            count=150,
+        )
+        self._strategy_history_thread.history_loaded.connect(self._on_strategy_history_loaded)
+        self._strategy_history_thread.start()
+
         self.auto_mode = True
 
         # Push the initial "paper"/"demo"/"live" badge state into the
@@ -167,6 +200,14 @@ class DashboardController:
         # fed into the executor so SL/TP can be ATR-based instead of a
         # flat percentage (see trading/executor.py).
         self._latest_atr = None
+
+        # latest EMA 20/50 trend read ("Uptrend"/"Downtrend"/"Sideways"),
+        # refreshed by update_indicators() each tick — fed into the
+        # executor's PHASE 2 Sideways-regime entry gate below. Initialized
+        # here (not just inside update_indicators()) so the executor call
+        # in refresh_ui() has a safe getattr default before the first
+        # 15-candle warm-up completes.
+        self._latest_ema_trend = None
 
         event_bus.subscribe(self.on_market_update)
 
@@ -223,6 +264,14 @@ class DashboardController:
             self.candle_manager.on_trade(price_f, size, side, ts)
         except Exception as e:
             print("candle update error:", e)
+
+        try:
+            # Fed independently of the chart's candle_manager above —
+            # always aggregates at STRATEGY_TIMEFRAME_SECONDS regardless
+            # of what timeframe the chart is currently displaying.
+            self.strategy_candle_manager.on_trade(price_f, size, side, ts)
+        except Exception as e:
+            print("strategy candle update error:", e)
 
         try:
             self.paper_engine.mark_to_market(price_f)
@@ -327,19 +376,44 @@ class DashboardController:
         # executor, so evaluate() was always one tick stale on ATR) ----
         self.update_indicators()
 
+        # ---- fixed-timeframe regime/ATR (independent of chart) ----
+        # Recomputed from self.strategy_candle_manager, which is NEVER
+        # touched by the chart's TimeframeSelector — see
+        # strategy/regime_engine.py. This is what the executor gets
+        # below, not the chart-tied self._latest_atr /
+        # self._latest_ema_trend (those remain as-is for the AI panel's
+        # own chart-relative display, unchanged).
+        self._strategy_regime, self._strategy_atr = self.regime_engine.update()
+
         # ---- AI Engine -> Executor bridge (auto-trading) ----
         # Trades on market.confirmed_signal (persisted for several
         # seconds — see core/orderflow_engine.py), not the raw
         # per-tick market.signal, so a single noisy tick can no longer
-        # trigger an entry or a signal-flip on its own. ATR is passed
-        # through so the executor can set real ATR-based SL/TP instead
-        # of only ever exiting via signal flip.
+        # trigger an entry or a signal-flip on its own.
         try:
             self.executor.evaluate(
                 signal=getattr(market, "confirmed_signal", market.signal),
-                confidence=market.confidence,
+                # confirmed_signal is held for signal_hold_seconds after
+                # the qualifying tick — confirmed_confidence is the
+                # reading frozen at that SAME instant, so the executor
+                # never compares a stale-but-still-held signal against a
+                # live confidence that has since decayed below
+                # threshold (was: market.confidence, sampled fresh every
+                # tick — this was rejecting the vast majority of
+                # otherwise-valid STRONG BUY/SELL signals as
+                # confidence_below_threshold; see data/auto_trades_log.csv).
+                confidence=getattr(market, "confirmed_confidence", market.confidence),
                 price=self._latest_price,
-                atr=self._latest_atr,
+                # ATR + trend now come from the FIXED strategy timeframe
+                # (RegimeEngine / strategy_candle_manager), not the
+                # chart's candle_manager — was: self._latest_atr /
+                # self._latest_ema_trend, both of which silently changed
+                # value whenever the trader clicked a chart TIMEFRAME
+                # button, causing the fee-edge gate and ATR-based SL/TP
+                # to change with them. See data/auto_trades_log.csv,
+                # 2026-08-11 ~15:11 for the documented case.
+                atr=self._strategy_atr,
+                ema_trend=self._strategy_regime,
             )
         except Exception as e:
             print("auto-trade executor error:", e)
@@ -508,6 +582,19 @@ class DashboardController:
         except Exception as e:
             print("timeframe history backfill error:", e)
 
+    def _on_strategy_history_loaded(self, rows):
+        """One-shot startup backfill for the fixed-timeframe strategy
+        candle series (see __init__). Never touches the chart — this
+        feed exists purely to give RegimeEngine real history immediately
+        instead of waiting STRATEGY_TIMEFRAME_SECONDS x 15 for enough
+        live candles to accumulate on its own."""
+
+        try:
+            self.strategy_candle_manager.seed_history(rows)
+            print(f"✅ Strategy regime feed backfilled ({len(rows)} candles @ {STRATEGY_RESOLUTION})")
+        except Exception as e:
+            print("strategy history backfill error:", e)
+
     def toggle_pause(self):
 
         self.trading_paused = not self.trading_paused
@@ -566,6 +653,36 @@ class DashboardController:
         )
         self.executor.confidence_threshold = settings.get("min_ai_confidence_pct", self.executor.confidence_threshold)
         self.executor.cooldown_seconds = settings.get("cooldown_seconds", self.executor.cooldown_seconds)
+
+        # PHASE 1 FIX: these were previously never pushed anywhere —
+        # AutoTradeExecutor.__init__ builds ExitManager() with no
+        # config_dict, so config/settings.json's min_hold_minutes /
+        # flip_confidence_delta had zero effect at runtime (confirmed
+        # against flip_decisions_log.csv: min_hold_seconds_required was
+        # always 900 / flip_confidence_delta_required always 15.0 —
+        # the hard-coded ExitManager class defaults, not whatever was
+        # saved in Settings). Applied here now, same as every other
+        # setting on this screen, on both initial load and Save Settings.
+        self.executor.exit_manager.set_min_hold_minutes(
+            settings.get("min_hold_minutes", self.executor.exit_manager.min_hold_minutes)
+        )
+        self.executor.exit_manager.set_flip_confidence_delta(
+            settings.get("flip_confidence_delta", self.executor.exit_manager.flip_confidence_delta)
+        )
+
+        # PHASE 2: regime filter, fee-edge filter, circuit breaker.
+        self.executor.set_block_sideways_regime(
+            settings.get("block_sideways_regime", self.executor.block_sideways_regime)
+        )
+        self.executor.set_min_atr_fee_multiple(
+            settings.get("min_atr_fee_multiple", self.executor.min_atr_fee_multiple)
+        )
+        self.executor.risk_governor.set_max_daily_loss_usd(
+            settings.get("max_daily_loss_usd", self.executor.risk_governor.max_daily_loss_usd)
+        )
+        self.executor.risk_governor.set_max_consecutive_losses(
+            settings.get("max_consecutive_losses", self.executor.risk_governor.max_consecutive_losses)
+        )
 
         # What RESET BALANCE resets the paper account back to. Doesn't
         # touch the CURRENT balance by itself (that would silently

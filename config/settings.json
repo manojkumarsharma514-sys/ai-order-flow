@@ -1,11 +1,17 @@
 {
-  "default_leverage": 25,
-  "capital_allocation_pct": 50.0,
+  "default_leverage": 100,
+  "capital_allocation_pct": 75.0,
   "trade_risk_pct": 2.0,
   "auto_trade_size_btc": 1.0,
   "default_stop_loss_pct": 0.5,
   "default_take_profit_pct": 1.5,
-  "min_ai_confidence_pct": 50,
+  "min_ai_confidence_pct": 75,
   "cooldown_seconds": 60,
+  "min_hold_minutes": 15.0,
+  "flip_confidence_delta": 15.0,
+  "block_sideways_regime": true,
+  "min_atr_fee_multiple": 3.0,
+  "max_daily_loss_usd": 300.0,
+  "max_consecutive_losses": 4,
   "starting_paper_balance": 100.0
 }

@@ -1,7 +1,7 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import time
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QPointF, QRectF, QTimer, Qt
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QFrame,
@@ -64,6 +64,7 @@ class PriceAxis(QWidget):
         self.is_log = False
         self.current_price = None
         self.is_bullish = True
+        self.candle_countdown = None
         self.hover_y = None
         self.dragging = False
         self.last_mouse_y = 0.0
@@ -80,6 +81,12 @@ class PriceAxis(QWidget):
         self.is_bullish = is_bullish
         self.hover_y = hover_y
         self.update()
+
+    def set_candle_countdown(self, countdown):
+        """Update the current-candle countdown without recalculating the chart."""
+        if self.candle_countdown != countdown:
+            self.candle_countdown = countdown
+            self.update()
 
     def mousePressEvent(self, event):
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
@@ -155,6 +162,17 @@ class PriceAxis(QWidget):
             painter.setPen(QColor("#FFFFFF"))
             painter.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
             painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, f"{self.current_price:,.1f}")
+
+            # TradingView-style time remaining for the live candle.  It is
+            # drawn on the same right-hand scale, directly below the price
+            # unless the price is near the bottom of the visible range.
+            if self.candle_countdown:
+                timer_y = y_curr + 11
+                if timer_y + 18 > h:
+                    timer_y = y_curr - 30
+                timer_rect = QRectF(0, timer_y, PRICE_AXIS_WIDTH, 18)
+                painter.fillRect(timer_rect, bg_col)
+                painter.drawText(timer_rect, Qt.AlignmentFlag.AlignCenter, self.candle_countdown)
 
 
 class TimeAxis(QWidget):
@@ -623,8 +641,18 @@ class FootprintChart(QWidget):
         self.manual_max_p = None
         self.candle_width = 160
         self.pan_offset_x = 0.0
+        # The dashboard's selected timeframe is the single source of truth
+        # for the candle countdown.  Do not derive the close from the
+        # CandleManager's aggregated candle start_time: its aggregation can
+        # be offset (especially on 1H/4H/1D), while Delta/TradingView BTCUSD
+        # candles are aligned to UTC exchange boundaries.
         self.timeframe_sec = 300
+        self._selected_timeframe_sec = 300
         self.current_price = None
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._refresh_candle_countdown)
+        self._countdown_timer.start()
 
         # The chart's own size must only ever come from whatever
         # container/splitter it's placed in — never from its content.
@@ -684,7 +712,9 @@ class FootprintChart(QWidget):
 
     def set_candles(self, candles, timeframe_sec=300, current_price=None):
         self.candles = candles
-        self.timeframe_sec = timeframe_sec
+        # Incoming candle refreshes may carry a legacy/default timeframe.
+        # Never let them overwrite the timeframe selected in the dashboard.
+        self.timeframe_sec = self._selected_timeframe_sec
         # The live/forming candle's own high/low should already track
         # the latest tick, but ticks can arrive between candle updates
         # and chart redraws — explicitly folding the *actual* current
@@ -694,6 +724,7 @@ class FootprintChart(QWidget):
         self.current_price = current_price if current_price is not None else (
             candles[-1].close if candles else None
         )
+        self._refresh_candle_countdown()
 
         if self.auto_scale and self.candles:
             canvas_w = max(self.canvas.width(), 800)
@@ -717,9 +748,97 @@ class FootprintChart(QWidget):
         self.canvas.set_position_lines(lines)
         self._recalculate_and_draw()
 
-    def change_timeframe(self, tf_sec):
+    def set_timeframe(self, timeframe):
+        """Set timeframe from the dashboard selector (1m/5m/15m/1H/4H/1D)."""
+        timeframe_map = {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "1H": 3600,
+            "4H": 14400,
+            "1D": 86400,
+        }
+        tf_sec = timeframe_map.get(str(timeframe))
+        if tf_sec is None:
+            return
+
+        self._selected_timeframe_sec = tf_sec
         self.timeframe_sec = tf_sec
+        self._refresh_candle_countdown()
         self._reset_auto_scale()
+
+    def change_timeframe(self, tf_sec):
+        """Backward-compatible numeric timeframe setter."""
+        try:
+            tf_sec = int(tf_sec)
+        except (TypeError, ValueError):
+            return
+        if tf_sec <= 0:
+            return
+
+        self._selected_timeframe_sec = tf_sec
+        self.timeframe_sec = tf_sec
+        self._refresh_candle_countdown()
+        self._reset_auto_scale()
+
+    @staticmethod
+    def _next_utc_boundary(now_utc, tf_sec):
+        """Return the next exchange-aligned UTC candle close."""
+        if tf_sec < 3600:
+            epoch = now_utc.timestamp()
+            next_epoch = (math.floor(epoch / tf_sec) + 1) * tf_sec
+            return datetime.fromtimestamp(next_epoch, tz=timezone.utc)
+
+        if tf_sec == 3600:
+            return now_utc.replace(
+                minute=0, second=0, microsecond=0
+            ) + timedelta(hours=1)
+
+        if tf_sec == 14400:
+            block_hour = (now_utc.hour // 4) * 4
+            close = now_utc.replace(
+                hour=block_hour, minute=0, second=0, microsecond=0
+            )
+            if close <= now_utc:
+                close += timedelta(hours=4)
+            return close
+
+        if tf_sec == 86400:
+            close = now_utc.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            if close <= now_utc:
+                close += timedelta(days=1)
+            return close
+
+        epoch = now_utc.timestamp()
+        next_epoch = (math.floor(epoch / tf_sec) + 1) * tf_sec
+        return datetime.fromtimestamp(next_epoch, tz=timezone.utc)
+
+    def _refresh_candle_countdown(self):
+        """Show remaining time to the selected Delta/TradingView candle close."""
+        if not self.candles:
+            self.price_axis.set_candle_countdown(None)
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        next_close_utc = self._next_utc_boundary(
+            now_utc, int(self._selected_timeframe_sec)
+        )
+
+        remaining = max(
+            0,
+            math.ceil((next_close_utc - now_utc).total_seconds())
+        )
+
+        hours, remainder = divmod(remaining, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        countdown = (
+            f"{hours}:{minutes:02d}:{seconds:02d}"
+            if hours
+            else f"{minutes:02d}:{seconds:02d}"
+        )
+        self.price_axis.set_candle_countdown(countdown)
 
     def _reset_auto_scale(self):
         self.auto_scale = True
