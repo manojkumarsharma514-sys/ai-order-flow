@@ -31,3 +31,7 @@ __pycache__/
 dist/ 
 build/ 
 *.spec 
+
+# Runtime logs
+logs/
+*.log
