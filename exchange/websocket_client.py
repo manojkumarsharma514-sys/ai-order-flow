@@ -173,6 +173,14 @@ class DeltaWebSocketClient:
                     "spread"
                 ),
 
+                # Preserve exchange ordering metadata when Delta sends it.
+                # The feature engines still use local receipt time as the
+                # normalized clock because the exact exchange field varies by
+                # feed version, but retaining this makes later sequence-gap
+                # detection possible without another transport change.
+                "exchange_timestamp": data.get("timestamp") or data.get("time"),
+                "sequence": data.get("sequence") or data.get("seq_no"),
+
 
                 "timestamp": time.time()
 
@@ -285,7 +293,7 @@ class DeltaWebSocketClient:
                 ),
 
 
-                "timestamp": time.time()
+                    "timestamp": time.time()
 
             }
 

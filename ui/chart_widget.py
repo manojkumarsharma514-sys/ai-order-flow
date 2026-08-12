@@ -749,16 +749,36 @@ class FootprintChart(QWidget):
         self._recalculate_and_draw()
 
     def set_timeframe(self, timeframe):
-        """Set timeframe from the dashboard selector (1m/5m/15m/1H/4H/1D)."""
+        """Set timeframe from the dashboard selector (1m/5m/15m/1H/4H/1D).
+
+        Accepts either the button label ("1H") or the lowercase REST
+        resolution string ("1h") — TimeframeSelector.timeframe_changed
+        emits (resolution, seconds), and `resolution` is lowercase for
+        hour/day units ("1h"/"4h"/"1d"; see ui/timeframe_selector.py's
+        TIMEFRAMES list). Dashboard._on_timeframe_changed only declares
+        one parameter, so PyQt hands it that lowercase resolution
+        string, not the seconds int or the label.
+
+        Without .upper() here, "1h"/"4h"/"1d" never matched this map's
+        uppercase keys, so tf_sec came back None and the method
+        returned BEFORE updating self._selected_timeframe_sec — the
+        chart (and therefore the candle-close countdown, which reads
+        _selected_timeframe_sec) silently stayed on whatever timeframe
+        was active before switching to 1H/4H/1D. "1m"/"5m"/"15m" never
+        showed this because the "M"/"m" unit doesn't change case
+        between the label and the resolution string — only "H" and "D"
+        do, which is exactly why the countdown broke specifically on
+        the jump from 15m to 1H (and would also break for 4H/1D).
+        """
         timeframe_map = {
-            "1m": 60,
-            "5m": 300,
-            "15m": 900,
+            "1M": 60,
+            "5M": 300,
+            "15M": 900,
             "1H": 3600,
             "4H": 14400,
             "1D": 86400,
         }
-        tf_sec = timeframe_map.get(str(timeframe))
+        tf_sec = timeframe_map.get(str(timeframe).upper())
         if tf_sec is None:
             return
 
@@ -1039,14 +1059,14 @@ class ChartWidget(QWidget):
         super().__init__(parent)
 
         self.timeframe_map = {
-            "1m": 60,
-            "5m": 300,
-            "15m": 900,
+            "1M": 60,
+            "5M": 300,
+            "15M": 900,
             "1H": 3600,
             "4H": 14400,
             "1D": 86400,
         }
-        self.current_tf_str = "15m"
+        self.current_tf_str = "15M"
         self.current_tf_sec = 900
 
         self.candle_manager = CandleManager(
@@ -1079,7 +1099,7 @@ class ChartWidget(QWidget):
         tb_layout.addWidget(tf_label)
 
         self.tf_buttons = {}
-        for tf_str in ["1m", "5m", "15m", "1H", "4H", "1D"]:
+        for tf_str in ["1M", "5M", "15M", "1H", "4H", "1D"]:
             btn = QPushButton(tf_str)
             btn.setCheckable(True)
             btn.setFixedSize(36, 24)
