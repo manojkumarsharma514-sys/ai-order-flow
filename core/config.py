@@ -46,7 +46,17 @@ DEFAULT_SETTINGS = {
     # Phase 2 — entry-quality gates + circuit breaker (see
     # trading/executor.py gates 1 & 2, and trading/risk_governor.py).
     "block_sideways_regime": True,
-    "min_atr_fee_multiple": 3.0,
+    # 2026-08-12: was 3.0, revised down to 1.5 to match
+    # AutoTradeExecutor.__init__'s own constructor default. A proxy
+    # ATR%% built from 12 days of data/auto_trades_log.csv price
+    # stamps never once reached the 0.354%% (3.0x round-trip fee)
+    # this required — observed max was 0.267%% — so at 3.0x this gate
+    # was mathematically unclearable at BTC's actual recent
+    # volatility and accounted for 49-59%% of all skips on 2026-08-11
+    # and 2026-08-12. 1.5x still requires any executed trade's typical
+    # move to cover 1.5x its own round-trip fee cost; it just no
+    # longer demands a move BTC essentially never makes on a 15m bar.
+    "min_atr_fee_multiple": 1.5,
     "max_daily_loss_usd": 300.0,
     "max_consecutive_losses": 4,
 }

@@ -10,7 +10,7 @@
   "min_hold_minutes": 15.0,
   "flip_confidence_delta": 15.0,
   "block_sideways_regime": true,
-  "min_atr_fee_multiple": 3.0,
+  "min_atr_fee_multiple": 1.5,
   "max_daily_loss_usd": 300.0,
   "max_consecutive_losses": 4,
   "starting_paper_balance": 100.0

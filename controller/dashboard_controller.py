@@ -6,6 +6,7 @@ from core.orderflow_engine import orderflow_engine as market
 from core.candle_engine import CandleManager, aggregate_volume_profile, calculate_dynamic_tick_size
 from core.websocket_thread import HistoryFetchThread
 from core import event_bus
+from core.microstructure_logger import microstructure_logger
 
 from strategy.indicators import calculate_rsi, calculate_atr, calculate_vwap
 from strategy.trend import ema_trend
@@ -17,6 +18,9 @@ from trading.orders import OrdersManager
 from trading.journal import JournalManager
 from trading.executor import AutoTradeExecutor
 from trading.risk import calculate_risk_percent, risk_label
+from trading.positions import Position
+
+import pandas as pd
 
 from strategy.ai_engine import compute_factor_breakdown
 
@@ -88,6 +92,15 @@ class DashboardController:
         self.orders_manager = OrdersManager()
         self.journal_manager = JournalManager()
         self.analytics_engine = AnalyticsEngine(self.orders_manager)
+
+        # Data-integrity fix: Position._id_counter (trading/positions.py)
+        # resets to 1 on every process restart, which previously let a
+        # freshly-opened position reuse an id already sitting in the
+        # append-only orders_history.csv / trade_journal.csv from an
+        # earlier session. Must run BEFORE anything below (executor,
+        # paper_engine, AppStateHandler.restore_state) has a chance to
+        # open the first Position of this session.
+        self._seed_position_id_counter()
 
         # Every position close (manual, SL/TP, or AI auto-trade) fans
         # out to Orders CSV -> Journal CSV -> Analytics recompute ->
@@ -208,6 +221,14 @@ class DashboardController:
         # in refresh_ui() has a safe getattr default before the first
         # 15-candle warm-up completes.
         self._latest_ema_trend = None
+
+        # Diagnostics-only, throttled (default 1s) CSV audit trail of
+        # the raw microstructure features (book imbalance, executed
+        # flow, price-reaction confirmation/absorption) that drive the
+        # AI Engine's entry decisions — see core/microstructure_logger.py.
+        # Independent of trading/executor.py's auto_trades_log.csv,
+        # which only records what the executor actually acted on.
+        self.microstructure_logger = microstructure_logger
 
         event_bus.subscribe(self.on_market_update)
 
@@ -359,6 +380,29 @@ class DashboardController:
         except Exception as e:
             print("ai panel update error:", e)
 
+        # ---- Microstructure Diagnostics panel + throttled CSV log ----
+        # Reads straight from the same OrderFlowFeaturePipeline that
+        # drives market.signal/market.confidence (see
+        # core/orderflow_engine.py + core/orderflow_features.py) — this
+        # is purely a read-only diagnostics view + audit trail, it does
+        # not influence any trading decision itself.
+        try:
+            pipeline = market.pipeline
+            book_latest = pipeline.book.latest
+            flow_latest = pipeline.flow.latest
+            reaction_latest = pipeline.reaction.latest
+            decision = pipeline.decision
+
+            self.dashboard.microstructure.update_features(
+                book_latest, flow_latest, reaction_latest, decision
+            )
+
+            self.microstructure_logger.maybe_log(
+                pipeline, price=self._latest_price, decision=decision
+            )
+        except Exception as e:
+            print("microstructure diagnostics update error:", e)
+
         try:
             direction = "BULLISH" if market.buy_strength >= market.sell_strength else "BEARISH"
             self.dashboard.header.update_gauges(
@@ -434,6 +478,49 @@ class DashboardController:
 
     def _risk_label(self):
         return risk_label(self._risk_percent())
+
+    # -------------------------------------------------------
+    # Position ID continuity (see trading.positions.Position.seed_id_counter)
+    # -------------------------------------------------------
+
+    def _seed_position_id_counter(self):
+        """
+        Compute the next safe Position id as (highest id already
+        recorded in orders_history.csv OR trade_journal.csv) + 1, and
+        push it into Position._id_counter — so this session's ids
+        never collide with a prior session's rows in either
+        append-only CSV. Called once, from __init__, before this
+        controller wires anything capable of opening a position.
+
+        Reads both CSVs (order_id / trade_id respectively) rather than
+        just one, since either could in principle be ahead of the
+        other (e.g. a partial write, or a CSV edited by hand) — taking
+        the max across both is the safe, conservative choice.
+        """
+
+        highest_seen = 0
+
+        try:
+            orders_df = self.orders_manager.load_all()
+            if not orders_df.empty and "order_id" in orders_df.columns:
+                ids = pd.to_numeric(orders_df["order_id"], errors="coerce").dropna()
+                if not ids.empty:
+                    highest_seen = max(highest_seen, int(ids.max()))
+        except Exception as e:
+            print(f"position id seed (orders_history.csv) error: {e}")
+
+        try:
+            journal_df = self.journal_manager.load_all()
+            if not journal_df.empty and "trade_id" in journal_df.columns:
+                ids = pd.to_numeric(journal_df["trade_id"], errors="coerce").dropna()
+                if not ids.empty:
+                    highest_seen = max(highest_seen, int(ids.max()))
+        except Exception as e:
+            print(f"position id seed (trade_journal.csv) error: {e}")
+
+        next_id = highest_seen + 1
+        Position.seed_id_counter(next_id)
+        print(f"🔢 Position ID counter seeded at {next_id} (highest id on disk: {highest_seen})")
 
     # -------------------------------------------------------
     # Positions / Trade Setup (paper trading only)

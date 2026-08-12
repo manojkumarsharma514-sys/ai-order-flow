@@ -31,23 +31,49 @@ chart-tied indicators used for the AI Engine panel's own display
 what I'm currently viewing" numbers) — this is specifically for
 values that DRIVE trading decisions, which must not move just because
 someone clicked a timeframe button.
+
+STRATEGY_TIMEFRAME_SECONDS revision (2026-08-12): originally 1 hour
+(3600s). Audit finding: on 2026-08-12, a clean ~2-hour BTCUSD rally
+starting ~13:15 produced 54 of 63 STRONG BUY signals in that window
+rejected by trading.signal_gate.SignalGate with reason
+"regime_disagreement" — the fixed-timeframe EMA 20/50 trend read
+never flipped to Uptrend during the entire move (see
+data/auto_trades_log.csv, 2026-08-12 13:00-15:00). A 20-period EMA on
+1H bars needs on the order of 20 hours of price action to meaningfully
+respond, and the 50-period needs ~50 hours — both far slower than the
+typical intraday move this bot is meant to catch, so SignalGate was
+correctly filtering noise but also filtering out the start of every
+real trend, which is usually the most profitable part of the move.
+Lowered to 15 minutes (900s): a 20/50 EMA on 15m bars responds within
+roughly 5-12.5 hours instead of 20-50, catching an intraday breakout
+within its first hour or two rather than missing it outright, while
+still being far coarser than the raw tick signal it's gating (the
+noise problem SignalGate was built to solve — see trading/signal_gate.py
+docstring — was 1,937 STRONG BUY vs 2,686 STRONG SELL events within a
+single afternoon on the raw tick feed; 15m bars still average that out
+completely).
 """
 
 from strategy.indicators import calculate_atr
 from strategy.trend import ema_trend
 
 # Fixed strategy timeframe — deliberately independent of the chart's
-# TimeframeSelector. 1 hour is a reasonable starting point: coarse
-# enough to filter tick-level noise (see the "4,623 signal events in
-# 3.5 hours, 1 executed" case that motivated this module), fine enough
-# not to lag entries by many hours. Change here (not in the UI) if a
-# different strategy timeframe is wanted later.
-STRATEGY_TIMEFRAME_SECONDS = 3600
-STRATEGY_RESOLUTION = "1h"  # matches exchange.delta_api resolution codes
+# TimeframeSelector. See the 2026-08-12 revision note above: 15
+# minutes balances catching a real intraday move within its first
+# hour or two against still being far coarser than the raw tick
+# signal. Change here (not in the UI) if a different strategy
+# timeframe is wanted later.
+STRATEGY_TIMEFRAME_SECONDS = 900
+STRATEGY_RESOLUTION = "15m"  # matches exchange.delta_api resolution codes
 
 # Minimum candles needed before EMA 20/50 + ATR(14) are meaningful —
 # mirrors DashboardController.update_indicators()'s own 15-candle
-# warm-up guard for the chart-tied indicators.
+# warm-up guard for the chart-tied indicators. Note strategy.trend.
+# ema_trend() itself additionally requires >= slow+1 (51) candles
+# before it stops returning None — until then RegimeEngine.regime is
+# None, which trading.signal_gate.SignalGate and
+# AutoTradeExecutor._regime_permits_entry both already treat as
+# "unknown, fail open" rather than blocking trading during warm-up.
 MIN_CANDLES_FOR_REGIME = 15
 
 

@@ -19,6 +19,7 @@ from ui.topnav import TopNav, TABS
 from ui.chart_widget import FootprintChart
 from ui.timeframe_selector import TimeframeSelector
 from ui.ai_panel import AIPanel
+from ui.microstructure_panel import MicrostructurePanel
 from ui.volume_profile import VolumeProfile
 from ui.orderbook import OrderBook
 from ui.trades import RecentTrades
@@ -233,16 +234,18 @@ class Dashboard(QMainWindow):
         dom_col.addWidget(self.orderbook)
         top_splitter.addWidget(dom_container)
 
-        # --- Right Column: AI Panel + Volume Profile ---
+        # --- Right Column: AI Panel + Microstructure Diagnostics + Volume Profile ---
         right_container = QWidget()
         right_col = QVBoxLayout(right_container)
         right_col.setContentsMargins(0, 0, 0, 0)
         right_col.setSpacing(0)
 
         self.ai = AIPanel()
+        self.microstructure = MicrostructurePanel()
         self.volume_profile = VolumeProfile()
 
         right_col.addWidget(self.ai)
+        right_col.addWidget(self.microstructure)
         right_col.addWidget(self.volume_profile)
 
         right_scroll = QScrollArea()

@@ -45,6 +45,34 @@ class Position:
         self.exit_fee = 0.0
         self.total_fee = 0.0
 
+    @classmethod
+    def seed_id_counter(cls, next_id: int):
+        """
+        Data-integrity fix: `_id_counter` is a class-level
+        `itertools.count(1)`, which is fine within a single run, but
+        every relaunch of the app re-imports this module and gets a
+        brand-new counter starting back at 1 — so position #1/#2/#3...
+        opened THIS session collides with position #1/#2/#3... already
+        sitting in the append-only data/orders_history.csv and
+        data/trade_journal.csv from a PREVIOUS session. Same id,
+        different trades — a real problem for anything that looks a
+        trade up by id (the Journal tab's "View Report" button,
+        trading.exit_manager's flip-confidence logging by position_id,
+        any future export/reconciliation).
+
+        Callers are expected to compute `next_id` as (the highest id
+        already present across orders_history.csv / trade_journal.csv)
+        + 1, and call this exactly ONCE, at startup, before any
+        Position is constructed this session — see
+        DashboardController._seed_position_id_counter(). Calling it
+        after positions already exist this session would silently
+        collide THIS session's own ids with each other, so this is a
+        one-time startup step, not a runtime knob.
+        """
+
+        next_id = max(1, int(next_id))
+        cls._id_counter = itertools.count(next_id)
+
     def update_mark(self, price):
         self.mark_price = float(price)
 
