@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 
 from PyQt6.QtCore import QTimer
 
@@ -21,8 +22,6 @@ from trading.risk import calculate_risk_percent, risk_label
 from trading.positions import Position
 
 import pandas as pd
-
-from strategy.ai_engine import compute_factor_breakdown
 
 from core.config import ConfigManager
 from trading.journal import generate_report_html
@@ -138,6 +137,11 @@ class DashboardController:
         self.dashboard.journal_tab.notes_edited.connect(self._on_journal_notes_edited)
         self.dashboard.journal_tab.view_report_clicked.connect(self._on_view_report)
 
+        # Dedicated Analytics tab — P&L Calendar month navigation
+        self.dashboard.analytics_tab.calendar_month_requested.connect(
+            self._on_analytics_calendar_month_requested
+        )
+
         # Dedicated Settings tab — AI Auto Trading risk params + paper reset
         self.dashboard.settings_tab.risk_params_changed.connect(
             lambda size, sl_pct, tp_pct: self.executor.set_risk_params(
@@ -221,6 +225,14 @@ class DashboardController:
         # in refresh_ui() has a safe getattr default before the first
         # 15-candle warm-up completes.
         self._latest_ema_trend = None
+
+        # Analytics tab's P&L Calendar — which month it's currently
+        # showing, so a trade closing while the trader has navigated
+        # to a past month doesn't silently snap the view back to the
+        # current month underneath them (see refresh_history_tabs()).
+        now = datetime.now()
+        self._analytics_calendar_year = now.year
+        self._analytics_calendar_month = now.month
 
         # Diagnostics-only, throttled (default 1s) CSV audit trail of
         # the raw microstructure features (book imbalance, executed
@@ -945,8 +957,31 @@ class DashboardController:
 
         try:
             self.dashboard.analytics_tab.set_metrics(self.analytics_engine.latest_saved())
+            self.dashboard.analytics_tab.set_extras(self.analytics_engine.compute_extras())
+            self.dashboard.analytics_tab.set_calendar(
+                self._analytics_calendar_year,
+                self._analytics_calendar_month,
+                self.analytics_engine.compute_calendar(
+                    self._analytics_calendar_year, self._analytics_calendar_month
+                ),
+            )
+            self.dashboard.analytics_tab.set_recent_trades(self.orders_manager.load_records())
+            self.dashboard.analytics_tab.set_open_positions(self.paper_engine.positions)
         except Exception as e:
             print(f"analytics tab refresh error: {e}")
+
+    def _on_analytics_calendar_month_requested(self, year: int, month: int):
+        """Analytics tab's P&L Calendar '‹'/'›' buttons — fetch and
+        push just that month's data, without touching Orders/Journal."""
+
+        self._analytics_calendar_year = year
+        self._analytics_calendar_month = month
+
+        try:
+            data = self.analytics_engine.compute_calendar(year, month)
+            self.dashboard.analytics_tab.set_calendar(year, month, data)
+        except Exception as e:
+            print(f"analytics calendar navigation error: {e}")
 
     # -------------------------------------------------------
     # Extended indicators (VWAP / EMA trend / RSI / ATR)
@@ -1005,20 +1040,6 @@ class DashboardController:
                 rsi=rsi,
                 atr_level=atr_level,
             )
-
-            # ---- AI Engine: Signal Factor Breakdown (spec section 5) ----
-            breakdown = compute_factor_breakdown(
-                delta=market.delta,
-                buy_strength=market.buy_strength,
-                sell_strength=market.sell_strength,
-                dom_pressure=market.dom_pressure,
-                vwap_status=vwap_status,
-                ema_trend=trend_text,
-                rsi=rsi,
-                confidence=market.confidence,
-                signal=market.signal,
-            )
-            self.dashboard.ai.update_factor_breakdown(breakdown)
 
         except Exception as e:
             print("indicator update error:", e)
