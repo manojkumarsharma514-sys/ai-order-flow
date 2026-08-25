@@ -1,0 +1,98 @@
+In controller/dashboard_controller.py, two small additions.
+
+--------------------------------------------------------------------
+CHANGE 1 — connect the new signal from BOTH PositionsPanel instances
+(compact dashboard panel + dedicated Positions tab).
+
+Find this block (around line 132-140, right after the existing
+positions/trade_setup signal wiring):
+
+--- BEFORE ---
+        self.dashboard.positions.close_all_clicked.connect(self.close_all_positions)
+        self.dashboard.positions.reset_clicked.connect(self.reset_paper_account)
+        self.dashboard.trade_setup.buy_long_clicked.connect(self.open_long)
+        self.dashboard.trade_setup.sell_short_clicked.connect(self.open_short)
+        self.dashboard.statusbar.stop_clicked.connect(self.toggle_pause)
+        self.dashboard.timeframe.timeframe_changed.connect(self.change_timeframe)
+
+--- AFTER ---
+        self.dashboard.positions.close_all_clicked.connect(self.close_all_positions)
+        self.dashboard.positions.reset_clicked.connect(self.reset_paper_account)
+        # Edit SL/TP on an open position — wired on the compact
+        # Dashboard-tab panel here; the dedicated Positions tab's copy
+        # is wired below, next to its close_position_clicked hookup.
+        self.dashboard.positions.sl_tp_updated.connect(self._on_sl_tp_updated)
+        self.dashboard.trade_setup.buy_long_clicked.connect(self.open_long)
+        self.dashboard.trade_setup.sell_short_clicked.connect(self.open_short)
+        self.dashboard.statusbar.stop_clicked.connect(self.toggle_pause)
+        self.dashboard.timeframe.timeframe_changed.connect(self.change_timeframe)
+
+--------------------------------------------------------------------
+CHANGE 2 — same signal on the dedicated Positions tab.
+
+Find this line (around line 148):
+
+--- BEFORE ---
+        # Dedicated Positions tab (separate instance, show_close_column=True)
+        self.dashboard.positions_tab.close_position_clicked.connect(self.close_position_by_id)
+
+--- AFTER ---
+        # Dedicated Positions tab (separate instance, show_close_column=True)
+        self.dashboard.positions_tab.close_position_clicked.connect(self.close_position_by_id)
+        self.dashboard.positions_tab.sl_tp_updated.connect(self._on_sl_tp_updated)
+
+--------------------------------------------------------------------
+CHANGE 3 — add the handler itself. Place it right next to
+close_position_by_id (search for "def close_position_by_id"), adding
+the new method immediately after it:
+
+--- BEFORE ---
+    def close_position_by_id(self, position_id):
+        """Manual 'Close Position' button on the dedicated Positions tab."""
+
+        result = self.paper_engine.close_position(position_id, reason="manual")
+        if result is None:
+            print(f"⚠️ close_position_by_id: no open position with id {position_id}")
+        self.refresh_positions()
+
+--- AFTER ---
+    def close_position_by_id(self, position_id):
+        """Manual 'Close Position' button on the dedicated Positions tab."""
+
+        result = self.paper_engine.close_position(position_id, reason="manual")
+        if result is None:
+            print(f"⚠️ close_position_by_id: no open position with id {position_id}")
+        self.refresh_positions()
+
+    def _on_sl_tp_updated(self, position_id, new_stop_loss, new_take_profit):
+        """'✏ Edit' button on either Positions panel (compact dashboard
+        tab or dedicated Positions tab) — apply the trader's edited
+        Stop Loss / Take Profit to the live position. On rejection
+        (e.g. the value is on the wrong side of the current mark price,
+        or the position closed between opening the dialog and clicking
+        Save), surface the reason in the Trade Setup panel's warning
+        banner — same "never fail silently" pattern already used for
+        auto-trade rejections and manual order rejections — rather than
+        just logging it to the console where the trader would never see
+        it."""
+
+        ok, reason = self.paper_engine.modify_position_sl_tp(
+            position_id, stop_loss=new_stop_loss, take_profit=new_take_profit
+        )
+
+        if not ok:
+            print(f"⚠️ SL/TP edit rejected for position {position_id}: {reason}")
+            try:
+                self.dashboard.trade_setup.show_rejection(f"SL/TP edit failed: {reason}")
+            except Exception as e:
+                print(f"SL/TP rejection banner error: {e}")
+            return
+
+        self.refresh_positions()
+
+--------------------------------------------------------------------
+That's the whole change. No new imports needed — PositionsPanel's
+sl_tp_updated signal and PaperTradingEngine.modify_position_sl_tp are
+both already accessible through existing references
+(self.dashboard.positions / self.dashboard.positions_tab /
+self.paper_engine).

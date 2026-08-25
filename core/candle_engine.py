@@ -56,6 +56,16 @@ class Candle:
         # price_level -> {"buy": float, "sell": float}
         self.footprint = OrderedDict()
 
+        # True only for candles built by CandleManager.seed_history()
+        # (REST OHLCV backfill, volume synthesized across price levels
+        # by _synthesize_footprint -- see its docstring). Cleared back
+        # to False the moment a real live trade tick lands on this
+        # candle (see CandleManager.on_trade) -- that's the signal used
+        # to discard the REST-derived volume/footprint entirely rather
+        # than accumulate real trade data on top of it. Never true for
+        # a candle built purely from on_trade().
+        self.from_rest = False
+
     def update(self, price, size, side):
 
         if self.open is None:
@@ -87,6 +97,27 @@ class Candle:
             self.sell_volume += size
             self.delta -= size
             row["sell"] += size
+
+    def reset_volume_data(self):
+        """Discard everything derived from REST-synthesized volume
+        (this candle's own volume/buy_volume/sell_volume/delta/
+        trade_count/max_trade/trades/footprint) while keeping its
+        OHLC price shape (open/high/low/close), which came from real
+        exchange-reported prices and was never affected by the
+        contracts->BTC unit question. Called once, by
+        CandleManager.on_trade(), the moment a genuine live trade
+        tick arrives for a candle that was still marked from_rest —
+        see that method's docstring for why this exists."""
+
+        self.volume = 0.0
+        self.buy_volume = 0.0
+        self.sell_volume = 0.0
+        self.delta = 0.0
+        self.trade_count = 0
+        self.max_trade = 0.0
+        self.trades = []
+        self.footprint = OrderedDict()
+        self.from_rest = False
 
     def calculate_order_flow_analytics(self, imbalance_ratio=3.0):
         """Calculates Point of Control (POC) and diagonal buy/sell order flow imbalances."""
@@ -199,6 +230,25 @@ class CandleManager:
             self.candles.append(Candle(bucket, self.timeframe, self.tick_size))
             if len(self.candles) > self.max_candles:
                 self.candles.pop(0)
+        elif self.candles[-1].from_rest:
+            # This bucket already exists as a REST-backfilled candle
+            # (seed_history() below) whose volume/footprint is
+            # SYNTHESIZED from a single OHLCV row spread across price
+            # levels — not real per-trade data, and (by explicit
+            # choice, see exchange/delta_api.py's fetch_historical_candles)
+            # not unit-converted the way live trade ticks are. Every
+            # live tick from this point on IS real, correctly-scaled
+            # data, so the first one to land here discards the
+            # REST-synthesized volume/footprint entirely rather than
+            # accumulating real BTC-scale numbers on top of an already
+            # contract-scale-inflated baseline — which is what
+            # produced candles stuck showing huge "K"-notation numbers
+            # for their entire lifetime even as genuine live trades
+            # kept arriving (reported against a live screenshot,
+            # 2026-08-19). OHLC (open/high/low/close) is left intact
+            # here since those came from real exchange-reported prices
+            # and were never part of the units bug.
+            self.candles[-1].reset_volume_data()
 
         self.candles[-1].update(float(price), float(size), side)
 
@@ -226,6 +276,7 @@ class CandleManager:
                 c.close = float(row["close"])
                 c.volume = float(row.get("volume", 0))
                 _synthesize_footprint(c, self.tick_size)
+                c.from_rest = True
                 candles.append(c)
             except Exception:
                 continue

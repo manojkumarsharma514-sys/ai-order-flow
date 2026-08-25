@@ -68,6 +68,46 @@ it's considered at all. Checked immediately after `side` is confirmed
 actionable, ahead of confidence/cooldown/Sideways/fee-edge — regime
 alignment is now the primary filter on tick-engine noise, not a
 downstream cleanup gate.
+
+PHASE 4 (bug #7, identified after the previous session's cascade of
+six trade-execution fixes: position sizing ignored `trade_risk_pct`
+from Settings entirely — `calculate_position_size()` sized purely off
+`balance x leverage x margin_pct`, with zero reference to the stop
+distance the trade was actually about to open with. Confirmed against
+config/settings.json: trade_risk_pct=2.0 was configured, but a 100x
+leverage / 75% margin combination on a ~$100 paper balance produced a
+position whose stop-loss distance implied roughly 40% account risk if
+hit — an 20x overshoot of the configured limit, silently). Sizing is
+now RISK-BASED: the position is sized so that a stop-loss hit costs
+exactly `trade_risk_pct` of account balance, given the REAL stop
+distance (ATR-based when available, else the flat SL % fallback) this
+specific trade is about to be opened with — not a generic percentage
+disconnected from where the stop actually sits. leverage/margin_pct
+now act only as an upper-bound notional cap (unchanged formula, just
+demoted from primary driver to ceiling), so an unusually tight stop
+still can't produce a runaway size. See calculate_position_size() and
+the reordered sizing block in evaluate() below.
+
+PHASE 5 (confidence-scaled risk): the flat `trade_risk_pct` from Phase
+4 is now itself scaled by the AI Engine's confidence for the specific
+signal being acted on, via CONFIDENCE_RISK_TIERS /
+_risk_pct_for_confidence(). A barely-qualifying 55-60% signal still
+risks the conservative floor (2%), while a 91-100%-confidence signal
+is allowed up to a 30% risk ceiling — conviction now scales exposure,
+rather than every executed trade risking the same flat percentage
+regardless of how strong the signal was. Settings' "Trade Risk %"
+field becomes the fallback used only when no confidence is available
+(and remains the sizing basis for manual trades). Tiers, exactly as
+specified:
+
+    confidence <= 60%   -> risk 2%
+    61-65%              -> risk 5%
+    66-70%              -> risk 10%
+    71-75%              -> risk 10%
+    76-80%              -> risk 15%
+    81-85%              -> risk 20%
+    86-90%              -> risk 25%
+    91-100%             -> risk 30%
 """
 
 import csv
@@ -89,6 +129,33 @@ AUTO_TRADES_LOG_PATH = Path("data") / "auto_trades_log.csv"
 ROUND_TRIP_FEE_PCT = TAKER_FEE_RATE * (1 + GST_RATE) * 2 * 100
 
 LOG_COLUMNS = ["timestamp", "symbol", "signal", "side", "price", "qty", "status", "reason"]
+
+# PHASE 5 — Confidence-Scaled Risk Table.
+#
+# Replaces the single flat `trade_risk_pct` as the value fed into
+# calculate_position_size() for AI_AUTO trades: a higher-conviction
+# signal is allowed to risk more of the account, a low-conviction one
+# stays capped near the conservative default. `trade_risk_pct` from
+# Settings is no longer used directly for AI_AUTO sizing — it's kept
+# only as the ultimate fallback (see _risk_pct_for_confidence) for the
+# rare case confidence isn't available, and as the sizing basis for
+# manual trades, which have no AI confidence to scale from.
+#
+# Ordered (upper_bound_inclusive, risk_pct). Looked up as "the first
+# tier whose upper bound the confidence is <= to" — so a confidence of
+# exactly 60 falls in the first (<=60) tier, exactly 65 in the second,
+# etc. Anything above the last tier's bound (100) is clamped to the
+# last tier's risk_pct.
+CONFIDENCE_RISK_TIERS = [
+    (60.0, 2.0),    # confidence <= 60%      -> risk 2%
+    (65.0, 5.0),    # 61-65%                 -> risk 5%
+    (70.0, 10.0),   # 66-70%                 -> risk 10%
+    (75.0, 10.0),   # 71-75%                 -> risk 10%
+    (80.0, 15.0),   # 76-80%                 -> risk 15%
+    (85.0, 20.0),   # 81-85%                 -> risk 20%
+    (90.0, 25.0),   # 86-90%                 -> risk 25%
+    (100.0, 30.0),  # 91-100%                -> risk 30%
+]
 
 # Map the controller's confirmed display signal into the executor's
 # normalized internal position side.
@@ -113,7 +180,8 @@ class AutoTradeExecutor(QObject):
                  risk_governor: RiskGovernor = None,
                  signal_gate: SignalGate = None,
                  min_atr_fee_multiple: float = 1.5,
-                 block_sideways_regime: bool = True):
+                 block_sideways_regime: bool = True,
+                 trade_risk_pct: float = 2.0):
         super().__init__()
 
         self.paper_engine = paper_engine
@@ -165,12 +233,28 @@ class AutoTradeExecutor(QObject):
             "take_profit_pct": 1.5,
         }
 
-        # Dynamic Position Sizing (previously hardcoded to size=1.0 on
-        # every auto-trade regardless of account balance):
+        # PHASE 4 — Risk-Based Position Sizing (Settings: "Trade Risk %
+        # (of balance)"). This is now the PRIMARY sizing driver:
+        #
+        #   risk_amount_usd = balance * (trade_risk_pct / 100)
+        #   qty_btc         = risk_amount_usd / stop_distance_price
+        #
+        # i.e. the position is sized so a stop-loss hit costs exactly
+        # trade_risk_pct of the account, given the REAL stop distance
+        # this trade is about to open with (ATR-based, or the flat SL%
+        # fallback — see evaluate()). Pushed from Settings via
+        # set_trade_risk_pct(), same wiring pattern as everything else
+        # on that screen.
+        self.trade_risk_pct = trade_risk_pct
+
+        # Dynamic Position Sizing ceiling — leverage/margin% no longer
+        # drive size directly, they only cap it (see
+        # calculate_position_size below), so a very tight stop can't
+        # produce a runaway quantity:
         #
         #   Total Purchasing Power = Balance x Leverage
         #   Allocated Capital ($)  = Purchasing Power x Margin Usage %
-        #   Position Size (BTC)    = Allocated Capital / Current Price
+        #   Max Position Size (BTC) = Allocated Capital / Current Price
         #
         # Defaults match the spec: 25x leverage, 50% margin usage.
         self.leverage = 25
@@ -199,16 +283,85 @@ class AutoTradeExecutor(QObject):
         except (TypeError, ValueError):
             self.margin_pct = 0.50
 
-    def calculate_position_size(self, price: float) -> float:
+    def set_trade_risk_pct(self, value):
+        """value as a 0-100 percentage (e.g. 2.0 == risk 2% of balance
+        per trade), matching Settings' "Trade Risk % (of balance)"
+        spinbox. Used as the fallback/base risk for manual trades and
+        for AI_AUTO trades when confidence isn't available — for
+        AI_AUTO trades with a known confidence, _risk_pct_for_confidence()
+        below takes over instead (PHASE 5)."""
+        try:
+            self.trade_risk_pct = max(0.01, float(value)) if value else 2.0
+        except (TypeError, ValueError):
+            self.trade_risk_pct = 2.0
+
+    def _risk_pct_for_confidence(self, confidence) -> float:
+        """PHASE 5 — Confidence-Scaled Risk. Maps the AI Engine's
+        confidence (0-100) to a risk_pct via CONFIDENCE_RISK_TIERS: a
+        higher-conviction signal is allowed to risk more of the
+        account balance per trade, up to a 30% ceiling at 91-100%
+        confidence. Falls back to the flat Settings trade_risk_pct if
+        confidence is missing/invalid, so callers that don't have a
+        confidence reading (or manual trades) still get a sane value."""
+
+        try:
+            c = float(confidence)
+        except (TypeError, ValueError):
+            return self.trade_risk_pct
+
+        c = max(0.0, min(100.0, c))
+
+        for upper_bound, risk_pct in CONFIDENCE_RISK_TIERS:
+            if c <= upper_bound:
+                return risk_pct
+
+        return CONFIDENCE_RISK_TIERS[-1][1]  # confidence > 100 edge case, clamp to top tier
+
+    def calculate_position_size(self, price: float, stop_distance: float = None,
+                                 confidence: float = None) -> float:
         """
-        Dynamic Position Sizing Formula:
+        PHASE 4/5 — Risk-Based Position Sizing Formula (primary):
+
+            risk_pct        = _risk_pct_for_confidence(confidence)
+                               (falls back to the flat Settings
+                               trade_risk_pct when confidence is None)
+            risk_amount_usd = balance * (risk_pct / 100)
+            risk_qty_btc    = risk_amount_usd / stop_distance
+
+        `stop_distance` is the ABSOLUTE price distance (in USD) between
+        entry and stop-loss for the trade about to be opened — pass the
+        actual ATR-based or flat-percentage distance computed for this
+        trade (see evaluate() below), not a re-derived guess. If it's a
+        stop-loss hit, this sizing guarantees the realized loss is
+        exactly risk_pct of balance, net of the fixed leverage/margin
+        ceiling below.
+
+        `confidence` is the AI Engine's confidence (0-100) for the
+        signal this trade is being opened on — omit it (or pass None)
+        to use the flat Settings trade_risk_pct instead of the
+        confidence-scaled table, e.g. for manual trades that have no
+        AI confidence reading.
+
+        Leverage/margin% (ceiling, secondary):
+
             purchasing_power = balance * leverage
             allocated_usd    = purchasing_power * margin_pct
-            qty_btc          = allocated_usd / price
+            leverage_qty_btc = allocated_usd / price
+
+        The final size is the SMALLER of the two — risk-based sizing
+        can never be inflated beyond what leverage/margin allow, and a
+        very tight stop (which would otherwise imply a huge risk-based
+        qty) is capped by the same leverage ceiling that always existed.
+
+        When `stop_distance` isn't available yet (e.g. called before a
+        stop has been computed), falls back to the leverage/margin
+        figure alone — same behavior as before this fix, so warm-up
+        paths that call this without a resolved stop still return a
+        sane number rather than erroring.
 
         Rounded to 3 decimals; enforces a 0.001 BTC minimum lot size so
-        a near-zero balance/price edge case can't produce a zero/invalid
-        order quantity.
+        a near-zero balance/price/stop edge case can't produce a
+        zero/invalid order quantity.
         """
 
         balance = getattr(self.paper_engine, "balance", 0.0) or 0.0
@@ -218,7 +371,22 @@ class AutoTradeExecutor(QObject):
 
         purchasing_power = balance * self.leverage
         allocated_usd = purchasing_power * self.margin_pct
-        qty = allocated_usd / price
+        leverage_qty = allocated_usd / price
+
+        try:
+            stop_distance = float(stop_distance) if stop_distance is not None else None
+        except (TypeError, ValueError):
+            stop_distance = None
+
+        if not stop_distance or stop_distance <= 0:
+            # No real stop distance available yet — fall back to the
+            # leverage/margin ceiling alone, same as pre-fix behavior.
+            qty = leverage_qty
+        else:
+            risk_pct = self._risk_pct_for_confidence(confidence) if confidence is not None else self.trade_risk_pct
+            risk_amount_usd = balance * (risk_pct / 100)
+            risk_qty = risk_amount_usd / stop_distance
+            qty = min(risk_qty, leverage_qty)
 
         return max(0.001, round(qty, 3))
 
@@ -460,7 +628,6 @@ class AutoTradeExecutor(QObject):
             # Gates cleared — proceed with the flip.
             self.paper_engine.close_position(blocking_position.id, reason="ai_signal_flip")
 
-        size = self.calculate_position_size(price)
         sl_pct = self._risk_params["stop_loss_pct"] / 100
         tp_pct = self._risk_params["take_profit_pct"] / 100
 
@@ -486,12 +653,26 @@ class AutoTradeExecutor(QObject):
             else:
                 stop_loss = price + stop_distance
                 take_profit = price - target_distance
-        elif side == "LONG":
-            stop_loss = price * (1 - sl_pct)
-            take_profit = price * (1 + tp_pct)
         else:
-            stop_loss = price * (1 + sl_pct)
-            take_profit = price * (1 - tp_pct)
+            stop_distance = price * sl_pct
+            if side == "LONG":
+                stop_loss = price * (1 - sl_pct)
+                take_profit = price * (1 + tp_pct)
+            else:
+                stop_loss = price * (1 + sl_pct)
+                take_profit = price * (1 - tp_pct)
+
+        # PHASE 4/5 FIX: size is now computed from the ACTUAL stop
+        # distance this trade is opening with, and the risk_pct itself
+        # scales with this signal's confidence (see
+        # CONFIDENCE_RISK_TIERS / _risk_pct_for_confidence above) —
+        # so a low-conviction 55% signal still risks the conservative
+        # 2%, while a 92%-confidence signal is allowed up to 30%. This
+        # MUST run after stop_distance is resolved (moved below the
+        # ATR/flat-% block above, was previously computed from price
+        # alone before any stop existed).
+        size = self.calculate_position_size(price, stop_distance=stop_distance, confidence=confidence)
+        applied_risk_pct = self._risk_pct_for_confidence(confidence)
 
         position = self.paper_engine.open_position(
             side=side,
@@ -515,7 +696,10 @@ class AutoTradeExecutor(QObject):
         # A rejected order must not consume the entry cooldown.
         self._last_trade_time = datetime.now()
 
-        self._log_event(signal_label, side, price, qty=size, status="EXECUTED", reason="ai_signal")
+        self._log_event(
+            signal_label, side, price, qty=size, status="EXECUTED",
+            reason=f"ai_signal (risk_pct={applied_risk_pct:.1f}% @ confidence={confidence:.1f}%)",
+        )
 
         self.auto_trade_executed.emit({
             "side": side,
@@ -524,6 +708,7 @@ class AutoTradeExecutor(QObject):
             "status": "EXECUTED",
             "signal": signal_label,
             "confidence": confidence,
+            "risk_pct": applied_risk_pct,
             "position_id": position.id,
         })
 

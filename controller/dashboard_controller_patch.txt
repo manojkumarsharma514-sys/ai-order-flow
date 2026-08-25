@@ -1,0 +1,30 @@
+In controller/dashboard_controller.py, inside _apply_settings_to_live_controls(),
+add this call anywhere after `self.executor.set_margin_pct(margin_pct)`
+(placed right next to it, since it's the third leg of the same sizing
+formula):
+
+--- BEFORE ---
+        self.executor.set_leverage(leverage)
+        self.executor.set_margin_pct(margin_pct)
+
+        try:
+            self.dashboard.trade_setup.set_leverage(leverage)
+            self.dashboard.trade_setup.set_margin_pct(margin_pct)
+        except Exception as e:
+            print(f"apply leverage/margin to Trade Setup error: {e}")
+
+--- AFTER ---
+        self.executor.set_leverage(leverage)
+        self.executor.set_margin_pct(margin_pct)
+        # PHASE 4 FIX (bug #7): trade_risk_pct was loaded into
+        # settings.json / the Settings tab but never pushed into the
+        # executor — position sizing used to come purely from
+        # leverage x margin_pct, ignoring this value entirely. See
+        # trading/executor.py PHASE 4 docstring + calculate_position_size().
+        self.executor.set_trade_risk_pct(settings.get("trade_risk_pct", self.executor.trade_risk_pct))
+
+        try:
+            self.dashboard.trade_setup.set_leverage(leverage)
+            self.dashboard.trade_setup.set_margin_pct(margin_pct)
+        except Exception as e:
+            print(f"apply leverage/margin to Trade Setup error: {e}")

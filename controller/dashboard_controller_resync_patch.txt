@@ -1,0 +1,89 @@
+In controller/dashboard_controller.py (the version at
+C:\Users\admin\Desktop\AI-order-flow-NEW-main\controller\dashboard_controller.py,
+which has microstructure_logger — confirmed against your project's
+mounted copy), add a new method right after change_timeframe()'s
+existing helpers, i.e. right before `def toggle_pause(self):`.
+
+Find this (around line 617-630):
+
+--- ANCHOR (do not change, just locate it) ---
+    def _on_strategy_history_loaded(self, rows):
+        """One-shot startup backfill for the fixed-timeframe strategy
+        candle series (see __init__). Never touches the chart — this
+        feed exists purely to give RegimeEngine real history immediately
+        instead of waiting STRATEGY_TIMEFRAME_SECONDS x 15 for enough
+        live candles to accumulate on its own."""
+
+        try:
+            self.strategy_candle_manager.seed_history(rows)
+            print(f"✅ Strategy regime feed backfilled ({len(rows)} candles @ {STRATEGY_RESOLUTION})")
+        except Exception as e:
+            print("strategy history backfill error:", e)
+
+    def toggle_pause(self):
+--- END ANCHOR ---
+
+Insert the new method BETWEEN those two — i.e. right after the
+`_on_strategy_history_loaded` method's closing `except` block, and
+right before `def toggle_pause(self):`:
+
+    def resync_after_reconnect(self):
+        """
+        Called by core.ws_bridge.WebSocketBridge.handle_connection_change
+        when the WebSocket reconnects AFTER having been dropped — e.g.
+        the machine was asleep, wifi/VPN dropped, ISP hiccup. Live
+        candles only ever build from ticks, so any downtime is a
+        silent gap in both:
+
+            - self.candle_manager          (the chart, current timeframe)
+            - self.strategy_candle_manager (FIXED 1H feed driving
+              RegimeEngine's regime/ATR reads, which the executor's
+              trading gates act on — a stale regime here after a long
+              sleep could silently gate entries on outdated data)
+
+        Re-fetches REST OHLC history for both, in the background (same
+        HistoryFetchThread mechanism as startup and change_timeframe()),
+        and reuses the existing _on_timeframe_history_loaded /
+        _on_strategy_history_loaded handlers to seed it in once it
+        lands — no new candle-merging logic needed, since
+        CandleManager.seed_history() already replaces the whole series
+        with a fresh, continuous REST pull up to "now", which is
+        exactly what backfills the gap.
+
+        Deliberately does NOT clear the chart first (unlike
+        change_timeframe(), which is a user-initiated switch where a
+        brief blank flash is expected) — the currently-displayed
+        candles stay on screen until the fresh history lands, so a
+        short outage doesn't cause a visible flicker.
+        """
+
+        symbol = getattr(self.paper_engine, "symbol", "BTCUSD")
+
+        # Chart's current timeframe — reuse TimeframeSelector's own
+        # label->resolution lookup so this can never drift out of sync
+        # with what the chart is actually displaying.
+        try:
+            tf_label = self.dashboard.timeframe.current_label
+            resolution, _ = self.dashboard.timeframe._lookup(tf_label)
+        except Exception as e:
+            print(f"resync: could not resolve current timeframe, defaulting to 5m ({e})")
+            resolution = "5m"
+
+        self._history_thread = HistoryFetchThread(symbol=symbol, resolution=resolution, count=150)
+        self._history_thread.history_loaded.connect(self._on_timeframe_history_loaded)
+        self._history_thread.start()
+
+        # Fixed-timeframe strategy feed (1H) — independent of the
+        # chart, same as its startup backfill in __init__.
+        self._strategy_history_thread = HistoryFetchThread(
+            symbol=symbol, resolution=STRATEGY_RESOLUTION, count=150,
+        )
+        self._strategy_history_thread.history_loaded.connect(self._on_strategy_history_loaded)
+        self._strategy_history_thread.start()
+
+    def toggle_pause(self):
+
+--------------------------------------------------------------------
+That's the only change needed in this file. HistoryFetchThread and
+STRATEGY_RESOLUTION are both already imported at the top of the file,
+so no new imports are required.

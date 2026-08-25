@@ -90,6 +90,26 @@ class OrderBookEngine:
                 removed += -delta
         return added, removed, additions, removals
 
+    def _near_price_window(self, book: Dict[float, float], side: str, levels: int) -> Dict[float, float]:
+        """Top `levels` price levels closest to the touch — bids sorted
+        high-to-low (best bid first), asks sorted low-to-high (best ask
+        first). Same ordering _weighted_obi already uses.
+
+        Raw L2 snapshots from the exchange can carry 2,000+ distinct
+        price levels stretching far from the touch (confirmed via
+        console logs: 'Bids: 2202 Asks: 2151' on a live BTCUSD feed).
+        Any metric summed over the FULL book rather than this near-
+        price window gets dominated by whatever huge, mostly-static
+        resting size happens to sit deep away from price on one side —
+        which is exactly what was pinning bid_pull_score near 0 and
+        ask_pull_score near 1 for two straight days of live data before
+        this fix (see core.orderflow_features's confluence scoring,
+        which reads these two fields asymmetrically as a result)."""
+
+        if side == "bid":
+            return dict(sorted(book.items(), key=lambda kv: kv[0], reverse=True)[:levels])
+        return dict(sorted(book.items(), key=lambda kv: kv[0])[:levels])
+
     @staticmethod
     def _weighted_obi(bids: Dict[float, float], asks: Dict[float, float], levels: int) -> Tuple[float, float, float]:
         bid_rows = sorted(bids.items(), reverse=True)[:levels]
@@ -106,20 +126,34 @@ class OrderBookEngine:
             self._last = self._empty(timestamp, valid=False)
             return self._last
 
-        bid_added, bid_cancelled, bid_additions, _ = self._diff(self._bids, new_bids)
-        ask_added, ask_cancelled, ask_additions, _ = self._diff(self._asks, new_asks)
+        # Churn (added/cancelled) and the pull-score denominator are
+        # measured over the SAME near-price window as bid_liquidity /
+        # ask_liquidity / obi_weighted below (self.depth_levels) —
+        # previously this diffed the entire raw book (self._bids /
+        # self._asks, unbounded — 2,000+ levels on a live feed), which
+        # let deep, mostly-static resting size swamp the ratio. See
+        # _near_price_window's docstring for the full rationale.
+        prev_bid_window = self._near_price_window(self._bids, "bid", self.depth_levels)
+        prev_ask_window = self._near_price_window(self._asks, "ask", self.depth_levels)
+        new_bid_window = self._near_price_window(new_bids, "bid", self.depth_levels)
+        new_ask_window = self._near_price_window(new_asks, "ask", self.depth_levels)
+
+        bid_added, bid_cancelled, bid_additions, _ = self._diff(prev_bid_window, new_bid_window)
+        ask_added, ask_cancelled, ask_additions, _ = self._diff(prev_ask_window, new_ask_window)
+
         obi_near, near_bid, near_ask = self._weighted_obi(new_bids, new_asks, self.near_levels)
         obi_weighted, bid_liquidity, ask_liquidity = self._weighted_obi(new_bids, new_asks, self.depth_levels)
-        old_bid_total = sum(self._bids.values())
-        old_ask_total = sum(self._asks.values())
+
+        old_bid_total = sum(prev_bid_window.values())
+        old_ask_total = sum(prev_ask_window.values())
         bid_pull = min(1.0, bid_cancelled / max(old_bid_total, 1e-9))
         ask_pull = min(1.0, ask_cancelled / max(old_ask_total, 1e-9))
 
         # Replenishment means material displayed size was restored at a price
-        # that was present in the prior snapshot; execution attribution still
-        # requires trade-flow confirmation in the coordinator.
-        bid_replenish = sum(delta for price, delta in bid_additions.items() if price in self._bids)
-        ask_replenish = sum(delta for price, delta in ask_additions.items() if price in self._asks)
+        # that was present in the prior snapshot's near-price window; execution
+        # attribution still requires trade-flow confirmation in the coordinator.
+        bid_replenish = sum(delta for price, delta in bid_additions.items() if price in prev_bid_window)
+        ask_replenish = sum(delta for price, delta in ask_additions.items() if price in prev_ask_window)
         median_near = max((near_bid + near_ask) / max(self.near_levels * 2, 1), 1e-9)
         spoof_bid, spoof_ask = self._spoof_risk(new_bids, new_asks, bid_additions, ask_additions, median_near, timestamp)
         self._bids, self._asks = new_bids, new_asks

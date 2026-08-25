@@ -400,12 +400,31 @@ class FootprintCanvas(QWidget):
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _format_vol(self, val):
+        """Format a volume/delta figure for on-chart display.
+
+        2026-08-18 fix: trade sizes are now correctly denominated in
+        actual BTC (see exchange/websocket_client.py's contract->BTC
+        conversion) rather than raw whole-number Delta contract
+        counts. The old fallback here did `f"{int(val)}"` -- harmless
+        truncation back when a "typical" cell value was already a
+        whole number (e.g. 5 contracts), but with real BTC sizes most
+        individual footprint cells hold well under 1.0 (e.g. 0.005,
+        0.03, 0.686 BTC), so int() collapsed nearly every cell and
+        every candle's Delta/Total label to "0" -- exactly the "0
+        after the 1st candle" pattern reported against a live
+        screenshot. Sub-1 values now keep decimal precision instead of
+        being truncated to an integer.
+        """
         abs_v = abs(val)
         if abs_v >= 1_000_000:
             return f"{val/1_000_000:.2f}M"
         elif abs_v >= 1_000:
             return f"{val/1_000:.1f}K"
-        return f"{int(val)}"
+        elif abs_v >= 1:
+            return f"{val:.2f}"
+        elif abs_v > 0:
+            return f"{val:.3f}"
+        return "0"
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1019,19 +1038,6 @@ class FootprintChart(QWidget):
         # pill sitting near the bottom.
         bottom_reserve_px = 40.0
         min_p -= bottom_reserve_px * price_per_px
-
-        return min_p, max_p
-
-        # The Delta/Volume summary card is drawn just *below* each
-        # candle's low (FootprintCanvas.paintEvent: box_y = y_low + 6,
-        # box_h = 28), so the low side needs extra headroom in pixel
-        # terms specifically, not just price-symmetric padding, or the
-        # card gets clipped off the bottom of the canvas.
-        canvas_h = max(self.canvas.height(), 1)
-        span = max(max_p - min_p, 1e-9)
-        price_per_px = span / canvas_h
-        box_reserve_px = 40.0  # 6px gap + 28px card + a few px margin
-        min_p -= box_reserve_px * price_per_px
 
         return min_p, max_p
 

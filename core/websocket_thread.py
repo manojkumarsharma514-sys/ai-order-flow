@@ -3,7 +3,10 @@ import asyncio
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from exchange.websocket_client import DeltaWebSocketClient
-from exchange.delta_api import fetch_historical_candles, fetch_ticker
+from exchange.delta_api import (
+    fetch_historical_candles, fetch_ticker, fetch_contract_size,
+    set_contract_size, get_contract_size,
+)
 
 
 class HistoryFetchThread(QThread):
@@ -69,6 +72,27 @@ class WebSocketThread(QThread):
 
     def run(self):
 
+        # Fetch the REAL contract size from Delta's own product spec
+        # FIRST -- before the initial candle history backfill below AND
+        # before the WebSocket client processes a single trade. This
+        # must happen before fetch_historical_candles() so even the
+        # very first chart render on app launch uses correctly-scaled
+        # volume, not just everything from this point forward. A
+        # failed/slow fetch just means the safe 0.001 fallback (already
+        # set as exchange.delta_api's and DeltaWebSocketClient's
+        # default) is used until the next app restart -- never blocks
+        # or crashes startup.
+        try:
+            contract_size = fetch_contract_size(self.symbol)
+            if contract_size:
+                set_contract_size(contract_size)
+                print(f"✅ Contract size for {self.symbol}: {contract_size} BTC/contract (from Delta API)")
+            else:
+                print(f"⚠️ Using fallback contract size for {self.symbol} "
+                      f"(live fetch returned nothing)")
+        except Exception as e:
+            print("Contract size fetch error:", e, "— using fallback contract size")
+
         try:
             rows = fetch_historical_candles(symbol=self.symbol, resolution="5m", count=150)
             if rows:
@@ -83,6 +107,11 @@ class WebSocketThread(QThread):
         self.client.symbol = self.symbol
         self.client.on_event = self.market_event.emit
         self.client.on_connection_change = self.connection_changed.emit
+
+        # Keep the live-feed client's own conversion factor in sync
+        # with whatever was resolved above (live-fetched value, or the
+        # shared fallback if that fetch failed).
+        self.client.contract_size_btc = get_contract_size()
 
         try:
             loop.run_until_complete(

@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
-    QTableWidgetItem, QHeaderView, QPushButton, QSizePolicy
+    QTableWidgetItem, QHeaderView, QPushButton, QSizePolicy,
+    QDialog, QFormLayout, QDoubleSpinBox, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -22,7 +23,8 @@ COLUMN_WIDTHS = {
     "Take Profit": 95,
     "PnL ($)": 100,
     "PnL (%)": 85,
-    "": 80,  # per-row Close button column
+    "Edit": 90,     # per-row Edit SL/TP button column
+    "": 80,         # per-row Close button column (dedicated tab only)
 }
 
 # Fixed-width, monospace-ish numeric font so digit-count changes (e.g.
@@ -32,11 +34,88 @@ COLUMN_WIDTHS = {
 _NUMERIC_FONT = QFont("Consolas", 10)
 
 
+class EditSLTPDialog(QDialog):
+    """Small pop-up letting the trader change Stop Loss / Take Profit
+    on an already-open position — the chart's SL/TP lines and the
+    Positions table were previously read-only once a trade was placed,
+    with no way to move a stop or target after entry. Prefilled with
+    the position's current values; Save emits back to the panel, which
+    re-emits sl_tp_updated for the controller to apply."""
+
+    def __init__(self, position, parent=None):
+        super().__init__(parent)
+        self.position = position
+
+        self.setWindowTitle(f"Edit SL/TP — {position.symbol} {position.side} #{position.id}")
+        self.setStyleSheet("""
+            QDialog{ background:#131722; }
+            QLabel{ color:#c7cbd6; font-size:12px; }
+            QDoubleSpinBox{
+                background:#0b0e14; color:#ffffff; border:1px solid #232936;
+                border-radius:4px; padding:4px 6px; font-size:13px; font-weight:bold;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            f"Entry: {position.entry_price:,.1f}   Mark: {position.mark_price:,.1f}   "
+            f"({'LONG' if position.side == 'LONG' else 'SHORT'})"
+        )
+        info.setStyleSheet("QLabel{color:#7b8191; font-size:11px;}")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+
+        self.sl_spin = QDoubleSpinBox()
+        self.sl_spin.setRange(0, 100_000_000)
+        self.sl_spin.setDecimals(1)
+        self.sl_spin.setSingleStep(0.5)
+        self.sl_spin.setValue(position.stop_loss or 0.0)
+        form.addRow("Stop Loss", self.sl_spin)
+
+        self.tp_spin = QDoubleSpinBox()
+        self.tp_spin.setRange(0, 100_000_000)
+        self.tp_spin.setDecimals(1)
+        self.tp_spin.setSingleStep(0.5)
+        self.tp_spin.setValue(position.take_profit or 0.0)
+        form.addRow("Take Profit", self.tp_spin)
+
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "Leave a field at 0 to remove that protection entirely — "
+            "a position with Stop Loss at 0 has NO stop and unbounded downside."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel{color:#e67e22; font-size:10px;}")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def resolved_values(self):
+        """Returns (stop_loss, take_profit) as floats or None (0 ->
+        None, i.e. "no stop"/"no target"), ready to hand to
+        PaperTradingEngine.modify_position_sl_tp()."""
+        sl = self.sl_spin.value()
+        tp = self.tp_spin.value()
+        return (sl if sl > 0 else None), (tp if tp > 0 else None)
+
+
 class PositionsPanel(QWidget):
 
     close_all_clicked = pyqtSignal()
     reset_clicked = pyqtSignal()
     close_position_clicked = pyqtSignal(int)  # position.id
+    # (position_id, new_stop_loss_or_None, new_take_profit_or_None) —
+    # None means "clear this field", not "leave unchanged": the dialog
+    # always sends both current values, edited or not.
+    sl_tp_updated = pyqtSignal(int, object, object)
 
     def __init__(self, show_close_column: bool = False):
         super().__init__()
@@ -44,7 +123,9 @@ class PositionsPanel(QWidget):
         # The compact Dashboard-tab panel (default) keeps its original
         # 7-column layout. The dedicated POSITIONS tab instantiates
         # this with show_close_column=True to add a manual per-row
-        # "Close Position" button, per spec section 4.
+        # "Close Position" button, per spec section 4. The "Edit"
+        # SL/TP button is available on BOTH — adjusting risk on an open
+        # trade shouldn't require switching tabs.
         self.show_close_column = show_close_column
 
         # Lock this panel's own footprint in the bottom row so a PnL
@@ -128,7 +209,7 @@ class PositionsPanel(QWidget):
         self.table = QTableWidget()
 
         self.columns = ["Symbol", "Side", "Size", "Entry", "Mark",
-                         "Stop Loss", "Take Profit", "PnL ($)", "PnL (%)"]
+                         "Stop Loss", "Take Profit", "PnL ($)", "PnL (%)", "Edit"]
         if self.show_close_column:
             self.columns = self.columns + [""]  # per-row Close Position button
 
@@ -161,6 +242,13 @@ class PositionsPanel(QWidget):
 
         layout.addWidget(self.table)
 
+        # Keep a live reference to the position objects currently
+        # rendered, keyed by id, so the Edit button's click handler can
+        # look up fresh entry/mark/side/current-SL-TP at click time
+        # instead of capturing possibly-stale values from whenever the
+        # row was drawn.
+        self._positions_by_id = {}
+
     def set_account_mode(self, mode):
         """mode: "paper" | "demo" | "live" — updates the panel title
         ("POSITIONS (Paper/Demo/Live)") and hides RESET BALANCE
@@ -180,12 +268,15 @@ class PositionsPanel(QWidget):
 
     def update_positions(self, positions, total_pnl):
 
+        self._positions_by_id = {p.id: p for p in positions}
+
         self.table.setRowCount(len(positions))
 
         pnl_color = "#2ecc71" if total_pnl >= 0 else "#e74c3c"
         self.total_pnl_label.setText(f"Total P&L : {total_pnl:,.2f} USDT")
         self.total_pnl_label.setStyleSheet(f"color:{pnl_color}; font-weight:bold; font-size:13px;")
 
+        edit_col_index = self.columns.index("Edit")
         close_col_index = len(self.columns) - 1  # only meaningful if show_close_column
 
         for row, p in enumerate(positions):
@@ -228,6 +319,15 @@ class PositionsPanel(QWidget):
 
                 self.table.setItem(row, col, item)
 
+            edit_btn = QPushButton("✏ Edit")
+            edit_btn.setStyleSheet(
+                "background:#1a5cff; color:white; border-radius:4px; padding:2px 8px;"
+            )
+            edit_btn.clicked.connect(
+                lambda _checked, pid=p.id: self._open_edit_dialog(pid)
+            )
+            self.table.setCellWidget(row, edit_col_index, edit_btn)
+
             if self.show_close_column:
                 close_btn = QPushButton("Close")
                 close_btn.setStyleSheet(
@@ -237,3 +337,20 @@ class PositionsPanel(QWidget):
                     lambda _checked, pid=p.id: self.close_position_clicked.emit(pid)
                 )
                 self.table.setCellWidget(row, close_col_index, close_btn)
+
+    def _open_edit_dialog(self, position_id):
+        """'✏ Edit' button clicked for a given row. Looks the position
+        up fresh (rather than trusting whatever was captured at row-
+        draw time) since mark price / even the position's continued
+        existence can change between a repaint and a click — a
+        position that hit its SL/TP and closed in that window simply
+        has no dialog to open, rather than editing a stale snapshot."""
+
+        position = self._positions_by_id.get(position_id)
+        if position is None:
+            return  # closed (e.g. hit SL/TP) between last repaint and this click
+
+        dialog = EditSLTPDialog(position, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_sl, new_tp = dialog.resolved_values()
+            self.sl_tp_updated.emit(position_id, new_sl, new_tp)

@@ -167,6 +167,72 @@ class PaperTradingEngine:
 
         return None
 
+    def modify_position_sl_tp(self, position_id, stop_loss=None, take_profit=None):
+        """
+        Update Stop Loss / Take Profit on an already-OPEN position —
+        the missing piece behind "SL/TP lines drawn on the chart but no
+        way to actually move them after entry." Called from the
+        Positions panel's Edit SL/TP dialog (ui/positions.py
+        EditSLTPDialog); works identically for manual and AI_AUTO
+        positions — this doesn't check `source`.
+
+        `stop_loss` / `take_profit` here mean "set to this value" —
+        pass an explicit float to change it, or None to CLEAR it
+        entirely (no stop / no target), matching what the dialog's
+        resolved_values() sends (0 in the spinbox -> None here). This
+        is intentionally different from most other setters in this
+        codebase, which treat None as "leave unchanged" — there's no
+        separate "leave unchanged" concept needed here because the
+        dialog always round-trips both current values, edited or not.
+
+        Enforces a directional sanity check against the position's
+        CURRENT mark price before applying either field — a Stop Loss
+        placed on the wrong side of mark (e.g. above mark on a LONG)
+        would never trigger via Position.hit_stop_or_target()'s
+        <=/>= comparisons, silently leaving the position with no real
+        protection despite the table showing a value. Rejects the
+        whole update (both fields) rather than applying one and
+        silently dropping the other, so the trader isn't left guessing
+        which field actually took.
+
+        Returns (True, "") on success, or (False, reason) if the
+        position doesn't exist / a value fails the sanity check —
+        never raises, so a bad edit can't crash mark-to-market or the
+        UI refresh loop.
+        """
+
+        position = next((p for p in self.positions if p.id == position_id), None)
+        if position is None:
+            return False, f"No open position with id {position_id} (it may have already closed)"
+
+        try:
+            sl = float(stop_loss) if stop_loss is not None else None
+        except (TypeError, ValueError):
+            return False, "Stop Loss must be a number"
+
+        try:
+            tp = float(take_profit) if take_profit is not None else None
+        except (TypeError, ValueError):
+            return False, "Take Profit must be a number"
+
+        mark = position.mark_price
+
+        if position.side == "LONG":
+            if sl is not None and sl >= mark:
+                return False, f"Stop Loss ({sl:,.1f}) must be below current mark ({mark:,.1f}) on a LONG"
+            if tp is not None and tp <= mark:
+                return False, f"Take Profit ({tp:,.1f}) must be above current mark ({mark:,.1f}) on a LONG"
+        else:  # SHORT
+            if sl is not None and sl <= mark:
+                return False, f"Stop Loss ({sl:,.1f}) must be above current mark ({mark:,.1f}) on a SHORT"
+            if tp is not None and tp >= mark:
+                return False, f"Take Profit ({tp:,.1f}) must be below current mark ({mark:,.1f}) on a SHORT"
+
+        position.stop_loss = sl
+        position.take_profit = tp
+
+        return True, ""
+
     def close_all(self, reason="manual"):
 
         closed_pnl = 0.0
